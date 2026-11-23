@@ -1,0 +1,1530 @@
+"""ArmService·Studio를 감싸는 유일한 창구 (gui-spec 7·8절). 실행 방식, 조작권, REQ 임시 우회를 여기에 둔다."""
+
+import contextlib
+import json
+import logging
+import math
+import re
+import shutil
+import tempfile
+import threading
+import time
+from dataclasses import dataclass, replace
+from pathlib import Path
+
+import numpy as np
+
+from ..arm.kinematics import Kinematics
+from ..arm.sim_driver import SimDriver, make_sim_driver
+from ..core import logread
+from ..core.calibration import find_calibration
+from ..core.config import arm_files, load_robot_ex, load_workspace
+from ..core.ports import PortChoiceError, list_serial_ports, pick_port
+from ..core.scene import load_scene
+from ..core.types import DetectedObject, JointState, MotionResult, ToolPose
+from ..doctor import doctor
+from ..perception.manual import ManualSource
+from ..service.arm_service import ArmService
+from ..service.diagnostics import BIG_MOVES
+from ..service.stop_listener import StopListener
+from ..service.studio import Studio
+from ..service.targets import reason_text, tip_vector
+from ..task.policy import reachable
+from . import programs
+from .health import ServoHealth, count_events
+from .scene3d import Scene3D
+from .state import (
+    EMPTY,
+    SAFETY_TEXT,
+    LogBook,
+    LogRecord,
+    State,
+    hottest_text,
+    run_bands,
+)
+from .watchdog_link import WatchdogLink
+
+JOG_JOINTS = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll")  # JointState 순서
+JOINT_TEXT = {
+    "shoulder_pan": "어깨 회전", "shoulder_lift": "어깨 들기", "elbow_flex": "팔꿈치", "wrist_flex": "손목 굽힘", "wrist_roll": "손목 회전",
+    "gripper": "그리퍼",
+}  # JointState 순서
+CART_AXES = ("x", "y", "z", "yaw", "pitch")  # 작업대 좌표계. pitch 양수 = 손끝을 수평 쪽으로 든다 (REQ-037)
+ANGLE_AXES = {"yaw", "pitch"}
+DIAGNOSTICS = {"servoinfo": "서보 설정 읽기", "linkwatch": "연결 끊김 찾기", "powertest": "전원 시험", "shaketest": "떨림 시험"}
+RUN_POINTS = 600  # 실행 기록 그래프로 보내는 점의 상한
+SEQUENCE_POINTS = 300  # 화면에 보내는 기록 표본 수의 상한
+JOG_TOOL_MM_S = 100.0  # 속도 100%일 때. 컨트롤러가 60mm/s로 한 번 더 자른다
+JOG_YAW_DEG_S = 60.0
+RUN_MODES = {"sim": "시뮬레이션만", "real": "실제만", "both": "동시", "sim_first": "시뮬레이션 먼저"}
+REASON_EXTRA = {"z_ceiling": "허용 상자보다 높습니다"}  # service.targets에 아직 없는 이유
+BUSY_TEXT = "팔이 아직 움직이고 있습니다"
+US_BUILDING_TEXT = "초음파 기준값을 재는 중입니다(팔이 대기 자세에서 레이더를 세 바퀴 돌립니다)"  # gui-spec 12.11
+EXPLAIN_SPEED_PCT = 30  # 설명 모드 속도(gui-spec 12.11)
+EXPLAIN_PAUSE_S = 2.0  # 설명 모드 자동 실행이 흐름 단계마다 쉬는 시간
+PERCEPTION_TEXT = {"manual": "수동", "sim": "초음파(가상)", "real": "초음파(실물)"}
+CALIBRATING_TEXT = "캘리브레이션 측정 중입니다(팔 연결을 잠시 끊고 포트를 직접 엽니다)"
+NAME_RE = re.compile(r"[0-9A-Za-z가-힣_\- ]{1,40}")  # 자세·프로그램 이름(파일 이름에도 쓴다)
+ESTOP_FAILED_TEXT = "정지 명령을 서보에 쓰지 못했습니다({}). 팔이 계속 움직이면 전원 스위치를 끄세요"
+COMM_LOST_TEXT = "통신이 끊겼습니다. 케이블과 전원을 확인하고 [다시 연결]을 눌러 주세요"
+OUTSIDE_TEXT = "작업대 밖에서 출발했습니다. 안쪽으로만 움직일 수 있습니다"
+EDGE_TEXT = "작업대 가장자리 밖이라 움직이지 않았습니다"  # 이 문구면 화면이 "가장자리 검사를 끄고 다시 하기"를 묻는다
+OBJECTS_LOCKED_TEXT = "MuJoCo 시뮬레이션은 물체를 시작할 때 놓습니다. 바꾸려면 앱을 다시 시작하세요"
+PHYSICS_FAILED_TEXT = "물리 시뮬레이션이 멈췄습니다: {}. 앱을 다시 시작하세요"
+SAVED_RESTART_TEXT = "저장했습니다. MuJoCo 시뮬레이션은 앱을 다시 시작해야 적용됩니다"
+LINKWATCH_TEXT = "linkwatch를 실행 중입니다. 끝나면 팔을 다시 연결합니다"
+LOG_LEVELS = {"DEBUG": "INFO", "INFO": "INFO", "WARN": "WARNING", "ERROR": "ERROR", "FATAL": "ERROR"}
+def failed_reason(arm) -> str | None:
+    """MuJoCo 물리가 멈췄으면 이유(gui-spec 12.8). SimDriver·실물 드라이버나 시험용 가짜 팔에는 속성이 없다."""
+    return getattr(getattr(arm, "driver", None), "failed_reason", None)
+
+
+MOTION_TEXT = {
+    "ik_fail": reason_text("ik_fail"),
+    "out_of_bounds": "허용 범위 밖이라 움직이지 않았습니다",
+    "stopped": "정지 상태입니다. 정지 해제를 눌러 주세요",
+    "preempted": "다른 명령으로 바뀌었습니다",
+    "fault": "오류로 멈췄습니다",
+    "timeout": "시간 안에 끝나지 않았습니다",
+    "locked": "실제 팔이 잠겨 있어 움직이지 않았습니다. 장치 > 팔에서 이유를 확인해 주세요",
+    "no_object": "물체를 쥐지 못했습니다",
+    "height_required": "물체 높이가 필요해 집지 않았습니다. 턱 축이 팔 방향과 어긋나 손을 수직으로 내리는데, 높이를 모르면 턱이 물체 위 모서리를 칩니다. 높이 칸에 물체 높이를 넣어 주세요",  # 결정 0052
+}
+REASON_TEXT = {  # 팔이 reason 앞에 붙이는 이름 -> 원인과 할 일 (arm-software-spec 11.3.3·11.3.5, REQ-057·058)
+    "low_lift": "놓은 뒤 충분히 올라가지 못해 그 자리에서 멈췄습니다({}). 벌린 턱이 놓은 물체 바로 옆에 있으니 조그로 천천히 위로 올리세요(정지 해제 버튼이 보일 때만 먼저 누릅니다). 배출 구역을 팔 쪽으로 옮기면 덜 일어납니다",
+    "low_hover": "놓을 자리 둘레 물체가 높아 그 위로 10mm를 지키며 내려갈 수 없어 놓지 않았습니다({}). 물체를 쥔 채이니 놓기 점을 옮기거나 둘레 물체를 치우세요",
+    "drop_zone_full": "배출 구역 칸이 모두 차서 놓지 않았습니다({}). 물체를 쥔 채이니 배출 구역을 비운 뒤 다시 하세요",
+    "known_object": "놓을 자리가 알려진 물체와 겹칩니다({}). 놓기 점을 물체에서 떼거나 그 물체를 치우세요",
+    # 결정 0059: 막힘 감지 뒤 팔은 idle이라 정지 해제가 필요 없다. 문턱이 잠정값이라 오탐이면 문턱을 올린다
+    # 팔 #309(방금 놓은 물체를 쓸고 지나감)와 #536(위로 올려 돌아가는 길도 막힘) 둘 다
+    "home_blocked": "홈으로 가는 길이 막혀 가지 않았습니다({}). 직접 조작에서 손을 먼저 위로 올린 뒤 다시 홈을 누르세요",
+    "gripper_mismatch": "이 기록은 다른 그리퍼로 남겨 재생하지 않았습니다({})",  # REQ-113: 화면은 확인 창으로 [그래도 재생]을 묻는다
+    "blocked": "막힘 감지로 멈췄습니다({}). 무엇에 닿았으면 치우고 다시 하세요. 닿은 것이 없는데 자꾸 멈추면 설정 > 파라미터의 막힘 감지 문턱을 올리세요",
+}
+
+
+def _num(value: float) -> str:
+    return f"{value:g}"
+
+
+def update_workspace_text(text: str, values: dict, zone: str) -> str:
+    """workspace.yaml의 값만 바꾼다. yaml로 다시 쓰면 파일의 주석이 사라진다."""
+    rules = (
+        (r"^table_mm: \{.*?\}", f"table_mm: {{x: {_num(values['table_x'])}, y: {_num(values['table_y'])}}}"),
+        (r"^robot_base_in_table: \{.*?\}",
+         f"robot_base_in_table: {{x_mm: {_num(values['base_x'])}, y_mm: {_num(values['base_y'])}, yaw_deg: {_num(values['base_yaw'])}}}"),
+        (r"^safety_margin_mm: \S+", f"safety_margin_mm: {_num(values['margin'])}"),
+    )
+    for pattern, replacement in rules:
+        text, count = re.subn(pattern, replacement, text, flags=re.MULTILINE)
+        if count != 1:
+            raise ValueError(f"workspace 파일에서 찾지 못한 항목: {pattern}")
+
+    def zone_line(m: re.Match) -> str:  # 배출 구역은 가운데 x·y만 바꾸고 w_mm·h_mm·slot_mm 같은 다른 키는 그대로 둔다(arm-software-spec 11.3.5)
+        line = re.sub(r"\bx_mm: [^,}]+", f"x_mm: {_num(values['zone_x'])}", m.group(0), count=1)
+        return re.sub(r"\by_mm: [^,}]+", f"y_mm: {_num(values['zone_y'])}", line, count=1)
+
+    text, count = re.subn(rf"^  {re.escape(zone)}: \{{.*?\}}", zone_line, text, flags=re.MULTILINE)
+    if count != 1:
+        raise ValueError(f"workspace 파일에서 찾지 못한 배출 구역: {zone}")
+    return text
+
+
+@dataclass
+class Plan:
+    ok: bool
+    text: str
+    reason: str | None = None  # 안 닿을 때의 이유 코드(예: workspace = 작업대 가장자리)
+
+
+def with_first_report(report: dict, first: dict | None) -> dict:
+    """포트를 열지 않아 건너뛴 항목을 연결 전에 읽은 값으로 채운다."""
+    started = {c["name"]: c for c in (first or {}).get("checks", []) if c["state"] != "skip"}
+    checks = [
+        {**started[c["name"]], "text": f"{started[c['name']]['text']} (앱을 시작할 때 읽은 값)"} if c["state"] == "skip" and c["name"] in started else c
+        for c in report["checks"]
+    ]
+    return {**report, "checks": checks, "ok": not any(c["state"] == "fail" for c in checks)}
+
+
+class Backend:
+    workspace_path = "config/workspace.yaml"
+    arms_path = "config/arms"
+    local_path = "config/local.yaml"
+    waypoints_path = "config/waypoints.yaml"  # 자세 즐겨찾기 (결정 0044)
+    programs_dir = "config/programs"
+
+    def __init__(self, speed: float | None = None, log_root: str | None = "runs", link: WatchdogLink | None = None,
+                 viser_port: int | None = None, real_driver=None, arm_name: str | None = None, serials=(), port: str | None = None, first_report: dict | None = None,
+                 viser_host: str = "127.0.0.1", share: bool = False, web_port: int = 8080, sim_engine: str = "kinematic", sim_viewer: bool = False):
+        cfg, self.arm_info = load_robot_ex(arm=arm_name, serials=serials)
+        self._arm_option = arm_name
+        self._first_report = first_report  # 팔을 연결하기 전에 포트를 열어 읽은 점검 결과
+        self.sim_notice: str | None = None  # 실물 팔에 연결하지 못해 시뮬레이션으로 켰을 때 화면 위에 띄우는 안내(app.main)
+        self._linkwatching = False
+        self.last_pick_approach: dict | None = None  # 마지막 직접 조작 집기가 고른 기울여 집기(arm 6.6.1 approach: beta·phi·gamma·face), 수직이면 None
+        self._calibrating = False  # 캘리브레이션 측정 중(포트를 직접 연다, gui-spec 12.3)
+        self._closing = False
+        self.state = State()
+        self.link = link
+        self.share, self.web_port = share, web_port  # 다른 기기 보기(결정 0047): 상태줄 '공유 중' 배지와 주소
+        self.scene: Scene3D | None = None
+        self.reach = EMPTY
+        self.runs_root = log_root or "runs"
+        self.logbook = LogBook()
+        logging.getLogger().addHandler(self.logbook)
+        self._started_ns = time.time_ns()
+        self.run_focus: tuple | None = None  # 로그에서 고른 줄: (실행 이름, 시각). 실행 기록 페이지가 읽는다
+        self._next_object = 0
+        self._object_undo: list[list[DetectedObject]] = []  # 수동 입력 물체를 바꾸기 전 목록들(gui-spec 12.9 (나), Ctrl+Z)
+        self._object_undo_t = 0.0
+        self._listener = None
+        self.owner: str | None = None  # 조작권을 가진 브라우저. NiceGUI 이벤트 루프에서만 바꾼다
+        self.policy = None  # 정책 실행 페이지의 PolicyRunner. 페이지를 옮겨도 계속 돈다 (gui-spec 12.10 ③)
+        self.policy_loading = self.policy_cancel = False  # 정책을 불러오는 중인가, 그 사이 [정지]를 눌렀는가
+        self.policy_saved_params: dict = {}  # 정책 실행에 수집 프리셋을 적용하기 전 값. 실행이 끝나면 정책 페이지가 되돌린다
+        ws = load_workspace()
+        # 실행 기록은 주 팔 하나만 남긴다. 같은 초에 만들면 폴더 이름이 겹친다
+        self.real = ArmService(real_driver, cfg, ws, speed, log_root, proc="gui") if real_driver else None
+        # MuJoCo는 실제 팔 없는 --sim에서만(gui-spec 12.8). 쌍둥이 시뮬레이션은 늘 SimDriver
+        sim_driver = make_sim_driver(cfg, ws, load_scene(), viewer=sim_viewer) if real_driver is None and sim_engine == "mujoco" else SimDriver(cfg.poses.get("home"), object_grip=True)  # 물체 폭에서 그리퍼가 멈춰 쥔 물체가 생긴다(REQ-114, 피드백 F3)
+        self.sim = ArmService(sim_driver, cfg, ws, speed, None if real_driver else log_root, proc="gui")
+        self.arm = self.real or self.sim  # 상태줄과 3D의 실제 팔이 읽는 쪽
+        self.mode = "sim"
+        self.pending: tuple | None = None  # 시뮬레이션 먼저: 실제 팔로 실행할지 묻는 동작 (이름, action)
+        self._planning = False
+        self._record_name: str | None = None
+        self.program_run: programs.Run | None = None
+        for arm in self._arms():
+            ok, msg = arm.connect(port if arm is self.real else None)
+            if not ok:
+                raise RuntimeError(msg)
+        # 궤적 계산용으로 따로 둔다(팔의 Kinematics는 다른 스레드도 쓴다). 만드는 동안 파이썬 전체가 1초 넘게 멈춰, 감시 프로세스가 켜진 뒤에 만들면 앱이 강제 종료된다
+        self._path_kin = Kinematics(cfg.urdf, self.arm.ws.base, cfg.joint_limits_deg)
+        self.arm.status_stream(self.state.update)
+        self.health = ServoHealth()
+        self.arm.status_stream(self.health.update)
+        self.source = ManualSource()  # 정답 목록(수동 물체). objects()·편집은 늘 이것(gui-spec 12.11)
+        self.perception_source = self.source  # 작업 실행이 쓰는 인식 소스: 수동 또는 초음파(가상·실물)
+        self.perception_kind = "manual"
+        self._us_building = False  # 초음파(가상) 기준값을 재는 중
+        # 페이지 모듈과 순환하지 않게 여기서 부른다
+        from .sensors.ultrasonic_view import UltrasonicLog
+
+        self.us_log = UltrasonicLog()
+        self.explain = False  # 설명 모드(gui-spec 12.11): 흐름 단계마다 멈추고 캡션
+        self.show_truth = True  # 초음파(가상)에서 정답 물체를 3D에 흐리게(12.11)
+        self._speed_before: float | None = None  # 설명 모드 실행 동안 바꾼 속도의 원래 값
+        self._flow: tuple = ("idle", None)  # 캡션용 마지막 흐름 단계(pace의 step, stage)
+        self._make_studio()
+        self._reconnect_failed = False
+        self.paused = False
+        if viser_port is not None:
+            self.scene = Scene3D(cfg, self.arm.ws, self.arm.kin, viser_port, viser_host)
+            if self._physical():
+                self.scene.plan_opacity = 0.4
+                self.sim.status_stream(self._on_sim_objects)
+            else:  # 기구학 엔진은 물리가 없다: 쥔 물체를 손끝에 붙여 그린다(피드백 F3)
+                self.sim.status_stream(self._on_held)
+            self.scene.set_objects(self.objects())
+            self.scene.set_parts(getattr(self.arm, "scene", None))  # 장면 부품(REQ-040). 팔이 아직 모르면 그리지 않는다
+            self.arm.status_stream(self.scene.update_status)
+            if self.real:
+                self.sim.status_stream(self._on_twin_status)
+        if link:  # 감시 프로세스의 정지 명령을 받는다
+            self._listener = StopListener(self.arm, link.stop_port).start()
+
+    def _make_studio(self) -> None:
+        """Studio는 컨트롤러를 붙들고 있어, 다시 연결하면 새로 만든다. 초음파 소스면 새 버스에 소스와 기록을 다시 붙인다(gui-spec 12.11 "데이터를 받는 길")."""
+        src = self.perception_source
+        self.studio = Studio(self.arm, src, dry_run=self.real is None and not self._physical())  # 기구학 엔진에는 잡히는 물체가 없어 접촉 없음도 성공으로 본다
+        self.studio.bus.subscribe("task", self._on_task)
+        if src is not self.source:
+            src.bus = self.studio.bus  # _begin_checkable은 버스가 None일 때만 넣는다: 옛 버스로 나가지 않게
+            self.us_log.clear()
+            self.us_log.attach(self.studio.bus)  # EventBus에는 구독 해제가 없어 새 버스마다 붙인다
+            if getattr(src, "baseline", None) is not None:
+                self.us_log.set_baseline(src.baseline.d)  # 기준값은 버스 없이 재서 이벤트로 오지 않는다
+
+    def _physical(self) -> bool:
+        """MuJoCo처럼 물체가 실제로 있는 시뮬레이션인가(gui-spec 12.8). SimDriver에는 속성이 없다."""
+        return getattr(self.sim.driver, "physical_objects", False)
+
+    def _no_object_ok(self, arm: ArmService) -> bool:
+        """쥐지 못해도(no_object) 성공으로 볼 팔: 기구학 엔진 시뮬레이션만."""
+        return arm is self.sim and not self._physical()
+
+    def physics_failed(self) -> str | None:
+        return failed_reason(self.sim)
+
+    def _on_held(self, status) -> None:
+        """기구학 엔진: ArmService.held(REQ-106)가 있으면 손끝 자세 + 손끝 기준 물체 자리로 3D 상자를 옮기고, 비면 놓은 자리에 내려 둔다."""
+        held = self.sim.held
+        if self.scene is None:
+            return
+        if held is None:
+            self.scene.drop_held()
+            return
+        q = status.joints
+        tool, R = self.sim.kin.fk(q), self.sim.kin.tool_axes(q)
+        center = np.array([tool.x_mm, tool.y_mm, tool.z_mm]) + R @ np.array(held["obj_in_tool_mm"])
+        self.scene.show_held(held["object"], tuple(float(v) for v in center), tool.yaw_deg + held["obj_yaw_in_tool_deg"])
+
+    def _on_sim_objects(self, _status) -> None:
+        """MuJoCo 물체 자리를 3D에 옮긴다. 물리가 멈췄거나 연결 전이면 읽지 않는다."""
+        driver = self.sim.driver
+        if self.scene is None or not getattr(driver, "connected", False) or self.physics_failed():
+            return
+        s = driver.sim_state()
+        self.scene.set_sim_objects(s["objects"], s["held"])
+
+    @property
+    def run_dir(self) -> str | None:
+        return str(self.arm.logger.dir) if self.arm.logger else None
+
+    def claim(self, client: str, remote: bool = False) -> bool:
+        """비어 있으면 조작권을 가져간다. 이 브라우저가 조작권을 가졌는지 돌려준다. 다른 기기(원격)는 늘 보기 전용이라 거부한다(결정 0047, gui-spec 12.6)."""
+        if remote:
+            return False
+        if self.owner is None:
+            self.owner = client
+            self.arm.log_event("owner", {"client": client})
+            if self.link:
+                self.link.want_armed = True
+        return self.owner == client
+
+    def real_allowed(self) -> bool:
+        """감시 프로세스가 응답할 때만 실제 팔을 움직인다 (decisions/0026). 시뮬레이션은 상관없다."""
+        return bool(self.link and self.link.alive)
+
+    def resume(self) -> str | None:
+        """비상 정지를 풀고 감시 프로세스에 다시 등록한다. 팔은 움직이지 않는다. 풀지 못하면 이유."""
+        for arm in self._arms():
+            arm.resume()  # 통신이 끊긴 팔은 컨트롤러가 거부한다 (decisions/0031)
+        if self.comm_lost():
+            return COMM_LOST_TEXT
+        if self.link:
+            self.link.rearm()
+        return None
+
+    def log_loss(self) -> int:
+        """실행 기록(events·status.jsonl)에 쓰지 못했거나 밀려 버린 줄 수. 늘어나면 화면이 알린다(디스크 가득 참·권한 등)."""
+        return sum(getattr(a.logger, "write_errors", 0) + getattr(a.logger, "dropped_total", 0) for a in self._arms() if getattr(a, "logger", None))
+
+    def comm_lost(self) -> bool:
+        return bool(self.real and (self._reconnect_failed or self.real.ctl.fault == "comm_lost"))
+
+    def reconnect(self) -> tuple[str | None, list[str] | None]:
+        """통신이 끊긴 뒤 다시 연결한다. 팔은 움직이지 않고 토크도 끄지 않는다. (실패 이유, 토크가 꺼진 서보). 스레드에서 부른다."""
+        if not self.comm_lost():  # 멀쩡한 연결을 끊으면 움직이던 동작이 끊긴다
+            return "통신이 끊긴 상태가 아닙니다", None
+        self.record_finish()
+        return self._connect_real()
+
+    def _pick_port(self) -> str:
+        cfg = self.real.cfg
+        return pick_port(list_serial_ports(), cfg.board_serial, None, self.arm_info["local"].get("port"), cfg.port)[0]
+
+    def _connect_real(self) -> tuple[str | None, list[str] | None]:
+        try:
+            port = self._pick_port()
+        except PortChoiceError as e:
+            self._reconnect_failed = True
+            return str(e), None
+        try:
+            ok, msg = self.real.connect(port)
+            if not ok:
+                self._reconnect_failed = True
+                return msg, None
+            if self.link:
+                self.link.run_dir = self.run_dir
+            torque = self.real.driver.read_health()["torque"]
+        except Exception as e:  # noqa: BLE001  연결 직후 읽기가 실패하면 새 컨트롤러에 fault가 없어 끊김이 지워진 것처럼 보인다
+            self._reconnect_failed = True
+            return str(e), None
+        finally:
+            if self.link:
+                self.link.rearm()
+        self._reconnect_failed = False
+        self._make_studio()
+        return None, [name for name, on in torque.items() if not on]
+
+    # ---- 실행 방식 (gui-spec 8절). 실제 장치용과 SimDriver용 ArmService를 고른다
+    def set_run_mode(self, mode: str) -> str | None:
+        """실행 방식을 바꾼다. 못 바꾸면 이유를 돌려주고 그대로 둔다."""
+        if mode not in RUN_MODES:
+            return f"알 수 없는 실행 방식: {mode}"
+        if mode != "sim":
+            reason = self._real_blocked()
+            if reason:
+                return reason
+        self.mode, self.pending = mode, None
+        self.arm.log_event("run_mode", {"mode": mode})
+        return None
+
+    def move_lock(self) -> str | None:
+        """실제 팔을 움직일 수 없으면 이유: 새 팔이거나 캘리브레이션이 다를 때(decisions/0027), 통신이 끊겼을 때(0031).
+        초음파(가상) 기준값을 재는 동안(팔이 대기 자세로 가 있다)이 맨 앞이다(gui-spec 12.11)."""
+        if self._us_building:
+            return US_BUILDING_TEXT
+        if self.real is None:
+            failed = self.physics_failed()
+            return PHYSICS_FAILED_TEXT.format(failed) if failed else None
+        if self._linkwatching:
+            return LINKWATCH_TEXT
+        if self._calibrating:
+            return CALIBRATING_TEXT
+        return self.real.locked_reason or (COMM_LOST_TEXT if self.comm_lost() else None)
+
+    def setup_lock(self) -> str | None:
+        """팔 준비가 덜 되어 잠겼으면 이유. 통신 끊김처럼 다시 연결로 풀리는 잠금은 뺀다."""
+        return self.real.locked_reason if self.real else None
+
+    def tip_now(self) -> dict | None:
+        """지금 손끝(턱 끝 중간) 좌표: 작업대 기준 x·y, 작업대 면 위 높이 h, 손 yaw·pitch. 좌표 이동 칸과 같은 단위. 상태가 없으면 None."""
+        st = self.state.status
+        if st is None:
+            return None
+        t, arm = st.tool, self.arm
+        tip = tip_vector(arm.kin, t.pitch_deg, t.yaw_deg, st.joints.gripper, "tip")
+        return {"x": t.x_mm + tip[0], "y": t.y_mm + tip[1], "h": t.z_mm + tip[2] - arm.cfg.table_z_mm, "yaw": t.yaw_deg, "pitch": t.pitch_deg}
+
+    def _real_blocked(self) -> str | None:
+        if self.real is None:
+            return "실제 팔이 연결되어 있지 않습니다. 시뮬레이션만 쓸 수 있습니다"
+        if self.move_lock():
+            return self.move_lock()
+        if not self.real_allowed():
+            return "감시 프로세스가 응답하지 않아 실제 팔을 움직일 수 없습니다"
+        return None
+
+    def _targets(self) -> list[ArmService]:
+        """지금 방식에서 바로 움직일 팔. 시뮬레이션 먼저는 시뮬레이션만 움직이고 확인을 기다린다."""
+        if self.mode == "real":
+            return [self.real]
+        if self.mode == "both":
+            return [self.real, self.sim]
+        return [self.sim]
+
+    def _model_arm(self) -> ArmService:
+        """미리보기를 계산할 팔. 다음에 움직일 팔을 기준으로 한다."""
+        return self.real if self.mode == "real" else self.sim
+
+    @staticmethod
+    def _run_on(arm: ArmService, action) -> str | None:
+        if failed := failed_reason(arm):  # 물리가 멈춘 MuJoCo는 동작을 부르지 않는다
+            return PHYSICS_FAILED_TEXT.format(failed)
+        try:
+            result = action(arm)
+        except RuntimeError as e:  # 동작 중일 때만 "아직 움직이는 중", 잠김·연결 안 됨 같은 다른 이유는 그대로 보인다
+            return BUSY_TEXT if arm.ctl is not None and arm.ctl.busy else str(e)
+        except ValueError as e:  # 배율 때문에 속도 한계를 넘는 경우 등
+            return str(e)
+        if result.reason == "workspace":
+            return OUTSIDE_TEXT if Backend._starts_outside(arm) else EDGE_TEXT
+        if result.reason and "_out_of_reach:" in result.reason:  # REQ-031: 팔이 준 반경과 허용 범위를 그대로 보인다
+            kind, detail = result.reason.split(":", 1)
+            return f'{"집기" if kind.startswith("pick") else "놓기"} 점이 집기 범위 밖입니다:{detail}'
+        kind, _, detail = (result.reason or "").partition(":")
+        if detail and kind in REASON_TEXT:  # 일반 "정지 상태"·"닿지 않는 점" 대신 원인과 할 일
+            return REASON_TEXT[kind].format(detail.strip())
+        if result.status == "fault" and result.reason:  # 원인과 해결법 문장 (REQ-034)
+            return result.reason
+        return None if result.status == "ok" else MOTION_TEXT.get(result.status, result.status)
+
+    @staticmethod
+    def _starts_outside(arm: ArmService) -> bool:
+        """지금 손끝이 작업대 XY 밖인가. 밖에서는 안쪽으로 돌아오는 움직임만 허용된다 (decisions/0031)."""
+        tool, box = arm.kin.fk(arm.status().joints), arm.safety.box()
+        return not (box["x"][0] <= tool.x_mm <= box["x"][1] and box["y"][0] <= tool.y_mm <= box["y"][1])
+
+    def _dispatch(self, action, label: str) -> str | None:
+        """action(ArmService) -> MotionResult를 실행 방식대로 부른다. 실패 이유 또는 None. 스레드에서 부른다."""
+        if self.mode != "sim":
+            reason = self._real_blocked()
+            if reason:
+                return reason
+        targets = self._targets()
+        if len(targets) == 1:
+            reason = self._run_on(targets[0], action)
+        else:
+            reasons: list = [None, None]
+
+            def run(i: int, arm: ArmService) -> None:
+                reasons[i] = self._run_on(arm, action)
+
+            threads = [threading.Thread(target=run, args=(i, arm), daemon=True) for i, arm in enumerate(targets)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            reason = next((r for r in reasons if r), None)
+        if reason is None and self.mode == "sim_first":
+            self.pending = (label, action)
+        return reason
+
+    def confirm_pending(self) -> str | None:
+        """시뮬레이션에서 본 동작을 실제 팔로 실행한다."""
+        pending, self.pending = self.pending, None
+        if pending is None:
+            return None
+        reason = self._real_blocked()
+        return reason or self._run_on(self.real, pending[1])
+
+    def cancel_pending(self) -> None:
+        self.pending = None
+
+    def stop_all(self) -> None:
+        for arm in self._arms():
+            arm.stop()
+
+    def _arms(self) -> list[ArmService]:
+        return [self.sim] if self.real is None else [self.real, self.sim]
+
+    # ---- 직접 조작. 실패하면 이유 문장을, 성공하면 None을 돌려준다. 스레드에서 부른다
+    def home(self) -> str | None:
+        return self._dispatch(lambda arm: arm.home(), "홈으로 이동")
+
+    def park(self) -> str | None:
+        return self._dispatch(lambda arm: arm.park(), "파크로 이동")
+
+    def gripper(self, value: float) -> str | None:
+        return self._dispatch(lambda arm: arm.set_gripper(value), f"그리퍼 {value:.0f}")
+
+    def gripper_width(self, mm: float) -> str | None:
+        return self._dispatch(lambda arm: arm.set_gripper(mm, as_width=True), f"그리퍼 폭 {mm:.0f} mm")
+
+    def set_speed(self, pct: float) -> None:
+        if self._speed_before is not None and pct != EXPLAIN_SPEED_PCT:  # 설명 모드 실행 중 사람이 바꾼 속도를 되돌릴 값으로
+            self._speed_before = pct
+        for arm in self._arms():
+            arm.set_speed(pct)
+
+    def plan(self, x: float, y: float, h: float, yaw: float, pitch: float = -90.0) -> Plan:
+        """움직이지 않고 (x, y, 높이)에 손끝 각도 pitch로 닿는지 본다. 3D에 점, 계산 자세, 손끝 경로, 움직임 범위를 그린다."""
+        arm = self._model_arm()
+        pitch = min(0.0, max(-90.0, pitch))  # 팔이 받는 범위(-90 아래 ~ 0 수평)
+        pose = arm.point_pose(x, y, h, yaw, pitch=pitch)
+        reason, q = arm.preview_tool(pose)
+        path = None
+        duration = 0.0
+        if reason is None:
+            preview = arm.preview_path(pose)
+            reason, path, duration = preview["reason"], preview["tool"], preview["duration_s"]
+        ok = reason is None
+        text = f"닿습니다 · 약 {duration:.1f}초" if ok else REASON_EXTRA.get(reason) or reason_text(reason)
+        self.reach = "닿음" if ok else "안 닿음"
+        self._planning = True
+        if self.scene:
+            self.scene.set_preview(q if ok else None)
+            self.scene.show_target(x, y, h, ok, path)
+            try:  # 같은 pitch는 팔이 캐시한다. 동작 중이고 캐시가 없으면 이번에는 그리지 않는다
+                self.scene.show_reach(arm.reach_ranges(pitch))
+            except RuntimeError:
+                pass
+        return Plan(ok, text, reason)
+
+    def clear_plan(self) -> None:
+        self._planning = False
+        if self.scene:
+            self.scene.clear_target()
+
+    def _on_twin_status(self, status) -> None:
+        """실제 팔이 있으면 계산 자세 팔은 시뮬레이션 쪽 자세를 보여 준다.
+        시뮬레이션 팔이 움직이는 동안은 고른 목표 자세보다 이것이 먼저다("시뮬레이션 먼저"의 미리보기, gui-spec 11절 B8)."""
+        if self.scene and (not self._planning or status.state != "idle"):
+            self.scene.set_preview(status.joints)
+
+    def move_to(self, x: float, y: float, h: float, yaw: float, pitch: float = -90.0) -> str | None:
+        results = []
+
+        def run(arm: ArmService):
+            result = arm.move_tool(arm.point_pose(x, y, h, yaw, pitch=min(0.0, max(-90.0, pitch))))
+            results.append(result)
+            return result
+
+        reason = self._dispatch(run, f"x {x:.0f}, y {y:.0f}, 높이 {h:.0f}으로 이동")
+        self.clear_plan()
+        if results and results[0].position_error_mm is not None:
+            self.reach = f"오차 {results[0].position_error_mm:.1f} mm"
+        return reason
+
+    def jog(self, mode: str, index: int, sign: int) -> bool:
+        """누르는 동안 조그. 입력이 0.3초 끊기면 컨트롤러가 스스로 멈춘다. 시뮬레이션 먼저 방식은 시뮬레이션 팔만 움직인다."""
+        if self.mode != "sim" and self._real_blocked():
+            return False
+        speed = self.arm.speed / 100
+        if mode == "joint":
+            velocity = [0.0] * 6
+            velocity[index] = sign * self.arm.cfg.joint_v_max_deg_s * speed
+        else:
+            velocity = [0.0] * len(CART_AXES)
+            velocity[index] = sign * (JOG_YAW_DEG_S if CART_AXES[index] in ANGLE_AXES else JOG_TOOL_MM_S) * speed
+        moved = False
+        for arm in self._targets():
+            moved = arm.jog(mode, velocity) or moved
+        return moved
+
+    def jog_vector(self, fractions) -> bool:
+        """조이스틱(G13): 직교 축별 -1~1 비율을 한꺼번에. 순서는 CART_AXES. 0.3초 넘게 다시 부르지 않으면 팔이 스스로 멈춘다."""
+        if self.mode != "sim" and self._real_blocked():
+            return False
+        speed = self.arm.speed / 100
+        velocity = [max(-1.0, min(1.0, f)) * (JOG_YAW_DEG_S if axis in ANGLE_AXES else JOG_TOOL_MM_S) * speed
+                    for axis, f in zip(CART_AXES, list(fractions) + [0.0] * len(CART_AXES), strict=False)]
+        moved = False
+        for arm in self._targets():
+            moved = arm.jog("cartesian", velocity) or moved
+        return moved
+
+    def jog_release(self, mode: str) -> None:
+        """손을 떼면 속도를 0으로 내려 부드럽게 멈춘다."""
+        for arm in self._targets():
+            arm.jog(mode, [0.0] * (6 if mode == "joint" else len(CART_AXES)))
+
+    def jog_step(self, mode: str, index: int, amount: float) -> str | None:
+        """정해진 간격만큼 움직인다. 관절은 도, 직교는 mm(yaw·pitch는 도)."""
+
+        def run(arm: ArmService):
+            q = arm.status().joints
+            if mode == "joint":
+                name = JOG_JOINTS[index]
+                return arm.move_joints(replace(q, **{name: getattr(q, name) + amount}))
+            delta = [0.0] * len(CART_AXES)
+            delta[index] = amount
+            goal = arm.kin.step(q, *delta[:4], dpitch_deg=delta[4])
+            return arm.move_joints(goal) if goal else MotionResult("ik_fail", 0.0, ToolPose(0, 0, 0, 0))
+
+        return self._dispatch(run, "조그 간격 이동")
+
+    def joint_to(self, index: int, target_deg: float) -> str | None:
+        """관절 하나를 입력한 각도로 옮긴다(결정 0042 7번). 관절 이동과 같은 안전 검사를 거친다."""
+
+        def run(arm: ArmService):
+            name = JOG_JOINTS[index]
+            return arm.move_joints(replace(arm.status().joints, **{name: float(target_deg)}))
+
+        return self._dispatch(run, "관절 값 이동")
+
+    def pick_place(self, pick_xy: tuple[float, float], angle_deg: float, width_mm: float, length_mm: float,
+                   place_xy: tuple[float, float] | None, height_mm: float = 0.0) -> str | None:
+        """직접 조작 집어 옮기기(gui-spec 11절 B7, REQ-031). place_xy가 None이면 첫 배출 구역에 놓는다."""
+        obj = DetectedObject("manual-pick", float(pick_xy[0]), float(pick_xy[1]), float(angle_deg), float(width_mm), float(length_mm), 1.0, "manual",
+                             height_mm=float(height_mm))  # 0이면 팔이 설정 높이로 집는다 (REQ-034)
+        zone = None if place_xy else next(iter(self.arm.ws.drop_zones))
+
+        def run(arm: ArmService):
+            self._tell_known_objects(arm, near=pick_xy)
+            r = arm.pick_and_place(obj, zone=zone, place_at=place_xy)  # 놓을 곳을 같이 넘겨야 병렬 auto가 기울여 집기를 고른다(arm 6.6.1)
+            self.last_pick_approach = ((getattr(arm.skills, "last_pick_info", None) or {}).get("approach")) if r.status != "out_of_bounds" else None
+            if self._no_object_ok(arm) and r.status == "no_object":  # 기구학 엔진 팔은 쥘 물체가 없어 no_object여도 놓기까지 보인다(작업 실행의 dry-run과 같음)
+                return arm.place(zone=zone, at=place_xy)
+            return r
+
+        return self._dispatch(run, "집어 옮기기")
+
+    def _tell_known_objects(self, arm: ArmService, near: tuple[float, float] | None = None) -> None:
+        """놓을 때 벌림이 부딪히지 않게 수동 입력 물체를 팔에 알린다(REQ-050 `Skills.known_objects`, (x, y, 반경 mm)). near 둘레 40mm 안의 물체는 지금 집는 것이라 뺀다.
+        shortcut: 작업 시작 때 한 번 찍은 자리라 집어 옮긴 뒤 옛 자리가 남는다(배출 구역과 멀어 놓기를 막지 않음). 물체가 많아지면 놓을 때마다 다시 넘긴다."""
+        if getattr(arm, "skills", None) is None:
+            return
+        kept = [o for o in self.objects() if near is None or math.hypot(o.x_mm - near[0], o.y_mm - near[1]) > 40.0]
+        arm.skills.known_objects = [(o.x_mm, o.y_mm, max(o.width_mm or 0.0, o.length_mm or 0.0) / 2.0) for o in kept]
+        arm.skills.known_height = {(o.x_mm, o.y_mm): o.height_mm for o in kept}  # 집은 뒤 이 높이보다 들어 옮긴다(#352, TaskRunner와 같은 규칙)
+
+    # ---- 자세 즐겨찾기와 프로그램 (결정 0044). 실패하면 이유 문장, 성공하면 None
+    def waypoints(self) -> dict:
+        return programs.load_waypoints(Path(self.waypoints_path))
+
+    def save_waypoint(self, name: str) -> str | None:
+        """지금 자세(움직일 팔 기준)를 이름으로 저장한다. 같은 이름이면 덮어쓴다(즐겨찾기 표시는 유지)."""
+        name = name.strip()
+        if not NAME_RE.fullmatch(name):
+            return "이름은 한글·영문·숫자·_-·공백, 40자까지입니다"
+        st = self._model_arm().status()
+        wps = self.waypoints()
+        wps[name] = programs.pose_entry(st.joints, st.tool, wps.get(name, {}).get("favorite", False))
+        programs.save_waypoints(Path(self.waypoints_path), wps)
+        return None
+
+    def set_favorite(self, name: str, favorite: bool) -> None:
+        wps = self.waypoints()
+        if name in wps:
+            wps[name]["favorite"] = bool(favorite)
+            programs.save_waypoints(Path(self.waypoints_path), wps)
+
+    def delete_waypoint(self, name: str) -> None:
+        wps = self.waypoints()
+        if wps.pop(name, None) is not None:
+            programs.save_waypoints(Path(self.waypoints_path), wps)
+
+    def goto_waypoint(self, name: str) -> str | None:
+        wps = self.waypoints()
+        if name not in wps:
+            return f"저장된 자세 '{name}'이 없습니다"
+        joints = JointState(**{k: float(v) for k, v in wps[name]["joints"].items()})
+        return self._dispatch(lambda arm: arm.move_joints(joints), f"자세 {name}로 이동")
+
+    def program_names(self) -> list[str]:
+        return programs.program_names(Path(self.programs_dir))
+
+    def load_program(self, name: str) -> list:
+        return programs.load_program(Path(self.programs_dir), name)
+
+    def save_program(self, name: str, steps: list) -> str | None:
+        name = name.strip()
+        if not NAME_RE.fullmatch(name):
+            return "이름은 한글·영문·숫자·_-·공백, 40자까지입니다"
+        reason = programs.validate(steps, self.waypoints())
+        if reason:
+            return reason
+        programs.save_program(Path(self.programs_dir), name, steps)
+        return None
+
+    def run_program(self, steps: list, label: str, step_mode: bool = False) -> str | None:
+        """프로그램 전체를 동작 하나로 실행 방식대로 보낸다(시뮬레이션 먼저면 끝난 뒤 실제 팔 확인). 블로킹이라 스레드에서 부른다."""
+        wps = self.waypoints()
+        reason = programs.validate(steps, wps)
+        if reason:
+            return reason
+        if not steps:
+            return "단계가 없습니다"
+        if step_mode and self.mode == "both":  # 두 팔이 '다음 단계' 신호 하나를 나눠 쓰면 어긋난다
+            return "한 단계씩은 '동시' 실행 방식에서 쓸 수 없습니다"
+        self.program_run = programs.Run(step_mode)
+        act = programs.action(steps, wps, self.program_run, self._no_object_ok)
+        reason = self._dispatch(act, f"프로그램 {label}")
+        self.program_run.reason = reason
+        return reason
+
+    def stop_program(self) -> None:
+        if self.program_run:
+            self.program_run.stop.set()
+        self.stop_all()
+
+    # ---- 작업
+    def objects(self) -> list[DetectedObject]:
+        return self.source.scan().objects
+
+    def object_reachable(self, obj: DetectedObject) -> bool:
+        return reachable(obj, self.arm.ws, unconfirmed=hasattr(self.source, "start_check"))  # 작업 실행과 같은 기준: 확인 전 레이더 후보는 여유를 둔다 (REQ-065)
+
+    def _on_task(self, event) -> None:
+        self.state.on_task(event)
+        if event.state in ("DONE", "STOPPED", "FAULT") and self._speed_before is not None:  # 설명 모드 속도를 되돌린다
+            speed, self._speed_before = self._speed_before, None
+            self.set_speed(speed)
+        if event.state in ("PREPARE", "SCAN", "RESCAN"):  # 레이더가 다시 돈다: pace("scan")는 스캔이 끝나야 오므로 캡션을 ①로 되돌린다
+            self._flow = ("idle", None)
+        if self.scene and event.state in ("DECIDE", "PLACE", "DONE", "STOPPED"):
+            self.scene.set_objects(self._plan_objects(), self.state.chosen)
+
+    def _plan_objects(self) -> list[DetectedObject]:
+        """3D /objects에 진하게 그릴 물체: 수동이면 정답 목록, 초음파면 없음(정답은 [정답 보이기] 겹, 찾은 것은 인식 겹, 12.11)."""
+        return self.objects() if self.perception_source is self.source else []
+
+    def task_running(self) -> bool:
+        thread = self.studio._thread
+        return thread is not None and thread.is_alive()
+
+    # ---- 인식 소스와 설명 모드 (피드백 F2, gui-spec 12.11, ultrasonic-spec 8.9)
+    def _truth_boxes(self) -> list:
+        """정답 목록(수동 물체)을 가상 작업대 상자로. 높이를 모르면 40mm."""
+        from ..perception.ultrasonic.model import Box
+
+        return [Box(o.x_mm, o.y_mm, o.angle_deg or 0.0, o.width_mm or 30.0, o.length_mm or 100.0, o.height_mm or 40.0) for o in self.objects()]
+
+    def select_perception(self, kind: str, port: str | None = None) -> str | None:
+        """작업 실행의 인식 소스를 바꾼다: manual | sim(초음파 가상) | real(초음파 실물, port). 못 하면 이유(소스는 그대로). 스레드에서 부른다."""
+        if kind == self.perception_kind:
+            return None
+        if self.task_running():
+            return "작업 실행 중에는 인식을 바꿀 수 없습니다"
+        from ..perception.ultrasonic import radar
+        from ..service.ultrasonic import make_ultrasonic_source
+
+        src = self.source
+        if kind == "sim":
+            if self.real is not None:
+                return "초음파(가상)은 실물 팔이 없을 때만 씁니다"
+            self._us_building = True  # move_lock이 조그·작업 시작·스캔을 막는다
+            try:
+                src = make_ultrasonic_source(self.sim, sim=True, boxes=self._truth_boxes())  # 팔이 대기 자세로 가서 기준값을 잰다
+            except Exception as e:  # noqa: BLE001 radar_clear 실패(RuntimeError)·가상 장치 오류: 무엇이든 수동으로 남는다
+                return f"초음파(가상)을 켜지 못했습니다: {e}"
+            finally:
+                self._us_building = False
+        elif kind == "real":
+            if not port:
+                return "ESP32 센서 보드 페이지에서 실제 포트를 먼저 연결하세요"
+            try:
+                src = make_ultrasonic_source(self.arm, sim=False, port=port)
+                if not src.baseline_path.exists():
+                    with contextlib.suppress(Exception):
+                        src.close()  # 연 포트를 남기지 않는다
+                    return f"기준값 파일이 없습니다. radar_check --port {port} calibrate로 빈 작업대 기준값을 먼저 재세요"
+                src.connect()
+                src.baseline = radar.Baseline.load(src.baseline_path)  # 만든 직후 None이다(8.9)
+            except (OSError, SystemExit, ValueError) as e:
+                if src is not self.source:  # 열다 만 포트를 닫는다
+                    with contextlib.suppress(Exception):
+                        src.close()
+                return f"초음파(실물)을 열지 못했습니다: {e}"
+        elif kind != "manual":
+            return f"모르는 인식: {kind}"
+        old = self.perception_source
+        if old is not self.source:
+            with contextlib.suppress(Exception):
+                old.close()
+        self.perception_source, self.perception_kind = src, kind
+        self._make_studio()
+        self._drawn_version = None
+        self._changed_objects()  # 3D: 초음파면 정답을 진하게 그리지 않는다
+        self.arm.log_event("perception", {"kind": kind})
+        return None
+
+    def draw_recognition(self) -> None:
+        """작업 공간 3D의 인식 겹을 기록(us_log)이 바뀔 때만 다시 그린다. 화면 타이머가 부른다(버스 콜백에서 Viser를 부르지 않는다, 12.11)."""
+        if self.scene is None:
+            return
+        version = self.us_log.version if self.perception_source is not self.source else None
+        if version == getattr(self, "_drawn_version", None):
+            return
+        self._drawn_version = version
+        if version is None:
+            self.scene.show_recognition(None, None)
+        else:
+            esp = getattr(self.perception_source, "esp", None)
+            truth = list(esp.boxes) if esp is not None and self.show_truth else []
+            self.scene.show_recognition(self.perception_source.cfg, self.us_log.snapshot(), truth)
+
+    def _mark_flow(self, step: str, stage: str | None = None) -> None:
+        """빠른 모드의 pace: 멈추지 않고 캡션용 흐름 단계만 적는다(캡션은 두 모드 모두, gui-spec 12.11)."""
+        self._flow = (step, stage)
+
+    def _pace(self, step: str, stage: str | None = None) -> None:
+        """설명 모드의 흐름 단계 멈춤(ultrasonic-spec 8.9 "기다리기"). 작업 스레드에서 runner가 부른다.
+        paused면 [다음](Studio._step)을, 아니면 EXPLAIN_PAUSE_S를 기다린다. 정지·감시 정지(stopped/fault)면 바로 돌아온다."""
+        self._flow = (step, stage)
+        st = self.studio
+        st._step.clear()  # 팔이 움직이는 동안 누른 [다음]이 남아 이번 멈춤을 그냥 지나가지 않게
+        t0 = time.monotonic()
+        while not (st.task._stop or self.arm.ctl.state in ("stopped", "fault")):
+            if self.paused:
+                if st._step.wait(0.1):
+                    st._step.clear()
+                    return
+            elif time.monotonic() - t0 >= EXPLAIN_PAUSE_S:
+                return
+            else:
+                time.sleep(0.1)
+
+    def caption(self) -> str:
+        """작업 공간 3D 위 한 줄(gui-spec 12.11). 흐름 단계 ①~⑤를 쉬운 말로. 실행 중이 아니면 빈 문자열."""
+        if not self.task_running():
+            return ""
+        step, stage = self._flow
+        snap = self.us_log.snapshot() if self.perception_source is not self.source else {}
+        if step == "scan":
+            n = len(snap.get("candidates") or [])
+            return f"② 빈 작업대와 다른 곳: 후보 {n}개"
+        if step == "check":
+            words = {"L1": "첫 번째 직선", "L2": "두 번째 직선", "R": "원", "L34": "긴 축·짧은 축", "L3": "긴 축", "L4": "짧은 축", "GRID": "격자"}
+            nxt = next((p.get("stage") for p in reversed(snap.get("paths") or []) if p.get("phase") == "start"), stage)  # 다음 단계 이름은 phase=start로 안다
+            return f"③ 팔 센서로 후보를 지나갑니다 ({words.get(nxt or stage, '첫 구간')})"
+        if step == "check_done":
+            r = (snap.get("results") or [{}])[-1].get("object") or {}
+            if r:
+                return f"④ 위치 ({r.get('x_mm', 0):.0f}, {r.get('y_mm', 0):.0f}), 긴 축 {r.get('angle_deg') or 0:.0f}°"
+            return "④ 이 후보에는 물체가 없습니다"
+        if step == "pick":
+            return "⑤ 집습니다"
+        prog = snap.get("progress") or {}
+        if prog:
+            total = prog.get('total') or 0
+            turn = f" ({min(prog.get('pass', 0) + 1, total)}/{total}바퀴)" if total else ""  # pass는 실행 내내 세므로 이번 스캔 바퀴 수를 넘지 않게
+            return f"① 레이더가 돌며 거리를 잽니다{turn}"
+        return "① 레이더가 돌며 거리를 잽니다" if snap else ""
+
+    def scan(self) -> list[DetectedObject]:
+        if self.perception_source is not self.source:  # 초음파 소스는 작업 실행으로만 본다(gui-spec 12.11)
+            return self.objects()
+        objects = self.studio.perception.scan().objects
+        if self.scene:
+            self.scene.set_objects(objects, self.state.chosen)
+        return objects
+
+    def start_task(self, step_mode: bool = False) -> str | None:
+        """작업을 시작한다. 시작하지 못하면 이유를 돌려준다."""
+        if self.task_running():
+            return "이미 실행 중입니다"
+        if self.real and self.mode != "real":  # 작업은 주 팔(실제)에서 돈다. 다른 방식은 설계서가 나중으로 미뤘다
+            return "자동 작업은 실행 방식이 '실제만'일 때 씁니다"
+        if self.real and self._real_blocked():
+            return self._real_blocked()
+        if self.arm.ctl.state != "idle":  # 그대로 시작하면 동작 충돌로 곧 FAULT로 끝난다
+            return MOTION_TEXT["stopped"] if self.arm.ctl.state in ("stopped", "fault") else BUSY_TEXT
+        self.state.placed, self.paused, self.state.run_t0 = 0, step_mode, time.time()
+        for arm in self._arms():
+            self._tell_known_objects(arm)
+        task = self.studio.task  # Studio를 만들 때 한 번만 생기므로 실행마다 다시 넣는다(gui-spec 12.11)
+        task.pace, task.prefetch_enabled = (self._pace, False) if self.explain else (self._mark_flow, True)
+        self._flow = ("idle", None)
+        if self.perception_source is not self.source:
+            self.us_log.clear()
+            if getattr(self.perception_source, "baseline", None) is not None:
+                self.us_log.set_baseline(self.perception_source.baseline.d)
+        if self.explain:
+            self._speed_before = self.arm.speed
+            self.set_speed(EXPLAIN_SPEED_PCT)
+            self.studio.start(step_mode=False)  # 단계 실행이면 paused=True로 pace가 [다음]을 기다린다
+        else:
+            self.studio.start(step_mode=step_mode)
+        self._object_undo.clear()  # 실행한 작업은 되돌리지 않는다(gui-spec 12.9)
+        return None
+
+    def step_task(self) -> str | None:
+        """멈춘 작업을 한 단계 진행한다. 작업이 없으면 단계별 모드로 시작한다."""
+        if self.task_running():
+            self.studio.step()
+            return None
+        return self.start_task(step_mode=True)
+
+    def toggle_pause(self) -> None:
+        """다음 상태 변화에서 멈추거나 다시 이어 간다. 설명 모드는 paused만 뒤집는다(2초 쉬기 ↔ [다음] 대기, studio.pause와 겹치지 않게)."""
+        if not self.task_running():
+            return
+        self.paused = not self.paused
+        if self.explain:
+            return
+        if self.paused:
+            self.studio.pause()
+        else:
+            self.studio.resume()
+
+    def stop_task(self) -> None:
+        self.paused = False
+        self.studio.stop()
+        self.stop_all()
+
+    def rebuild_world(self, suite: str, seed: int):
+        """MuJoCo 세계를 시험장 묶음(suite)의 씨앗 seed 배치로 다시 짓는다(mujoco-spec 13.10.4 "세계 다시 짓기", 결정 0071 시연).
+        ① 정책 실행을 멈춘다 ② 드라이버 물체를 그 배치로(set_objects) ③ 시뮬레이션 팔을 기억 없이 다시 연결(connect(fresh=True), 팔은 홈)
+        ④ 수동 물체 목록·3D를 같은 물체로. 배치(mujoco_bench.Layout)를 돌려준다. 못 하면 ValueError(이유). 스레드에서 부른다."""
+        from ..arm import mujoco_bench
+
+        if not self._physical() or not hasattr(self.sim.driver, "set_objects"):
+            raise ValueError("학습 배치는 MuJoCo 시뮬레이션에서만 놓을 수 있습니다")
+        if self.policy is not None:
+            self.policy.stop()
+        lay = mujoco_bench.layout(suite, int(seed))
+        self.sim.driver.set_objects(lay.objects)  # 겹치면 ValueError(13.5)
+        ok, msg = self.sim.connect(fresh=True)
+        if not ok:
+            raise ValueError(f"다시 연결하지 못했습니다: {msg}")
+        for obj in self.objects():
+            self.source.remove(obj.id)
+        for o in lay.objects:
+            self.source.add(DetectedObject(o.name, o.x_mm, o.y_mm, o.angle_deg, o.width_mm, o.length_mm, 1.0, "manual", height_mm=o.height_mm))
+        self.state.placed = 0
+        self._changed_objects()
+        return lay
+
+    def _changed_objects(self) -> None:
+        esp = getattr(self.perception_source, "esp", None)
+        if esp is not None and not self.task_running():  # 정답 목록을 고치면 가상 작업대도(실행 중에는 아니다: 집혀 빠진 물체가 되살아나지 않게)
+            esp.boxes = self._truth_boxes()
+        if self.scene:
+            self.scene.set_objects(self._plan_objects(), self.state.chosen)
+
+    def add_object(self, x: float, y: float, angle: float = 0.0, width: float = 30.0, length: float = 100.0, height: float = 0.0) -> str:
+        """클릭한 자리에 물체를 놓고 id를 돌려준다."""
+        self._objects_locked()
+        self._remember_objects(coalesce=False)
+        self._next_object += 1
+        object_id = f"added-{self._next_object}"
+        self.source.add(DetectedObject(object_id, x, y, angle, width, length, 1.0, "manual", height_mm=height))
+        self._changed_objects()
+        return object_id
+
+    def move_object(self, object_id: str, x: float, y: float) -> None:
+        self._objects_locked()
+        self._remember_objects(coalesce=True)
+        old = next(o for o in self.objects() if o.id == object_id)
+        self.source.remove(object_id)
+        self.source.add(replace(old, x_mm=x, y_mm=y))
+        self._changed_objects()
+
+    def nudge_object(self, object_id: str, dx: float, dy: float, dangle: float = 0.0) -> None:
+        """고른 물체를 조금 옮기고 돌린다(G16). 각도는 0~180으로 감는다(물체는 180° 돌리면 같다)."""
+        self._objects_locked()
+        self._remember_objects(coalesce=True)
+        old = next((o for o in self.objects() if o.id == object_id), None)
+        if old is None:
+            return
+        self.source.remove(object_id)
+        self.source.add(replace(old, x_mm=old.x_mm + dx, y_mm=old.y_mm + dy, angle_deg=((old.angle_deg or 0.0) + dangle) % 180))
+        self._changed_objects()
+
+    def set_object_height(self, object_id: str, height: float) -> None:
+        """수동 입력 물체의 높이를 고친다(결정 0052: 수직으로 집는 물체는 높이가 있어야 집는다)."""
+        self._objects_locked()
+        self._remember_objects(coalesce=False)
+        old = next((o for o in self.objects() if o.id == object_id), None)
+        if old is None:
+            return
+        self.source.remove(object_id)
+        self.source.add(replace(old, height_mm=float(height)))
+        self._changed_objects()
+
+    def height_needed(self) -> set[str]:
+        """작업 실행에서 마지막 집기가 height_required였고 아직 높이가 없는 물체 id (REQ-057)."""
+        last = {e.object_id: e.result for e in list(self.state.events) if e.state == "PICK" and e.result}
+        return {o.id for o in self.objects() if last.get(o.id) == "height_required" and not o.height_mm}
+
+    def remove_object(self, object_id: str) -> None:
+        self._objects_locked()
+        self._remember_objects(coalesce=False)
+        self.source.remove(object_id)
+        self._changed_objects()
+
+    def reset_objects(self) -> None:
+        """파일에 적힌 처음 물체로 되돌린다(옮긴 표시도 지운다). 지금 있는 물체는 지운다."""
+        self._objects_locked()
+        self._remember_objects(coalesce=False)
+        for obj in self.objects():
+            self.source.remove(obj.id)
+        for obj in ManualSource().scan().objects:
+            with contextlib.suppress(KeyError):
+                self.source.remove(obj.id)  # 이미 옮겨 scan에 안 보이는 물체
+            self.source.add(obj)
+        self.state.placed = 0
+        if self.scene:
+            self.scene.clear_placed()  # 기구학 엔진에서 놓아 둔 상자(F3)도 지운다
+        self._changed_objects()
+
+    # ---- 설정
+    def get_safety(self) -> dict:
+        return self.arm.get_safety()
+
+    def free_table_edge(self) -> str | None:
+        """작업대 가장자리 검사만 끈다(자유 모드). 관절 한계·바닥·한 주기 이동량 검사는 그대로다 (decisions/0015)."""
+        cur = self.get_safety()
+        return self.set_safety("free", cur["joint_margin_deg"], cur["box_mm"])
+
+    def set_safety(self, mode: str, margin: float, box: dict | None) -> str | None:
+        """안전 설정을 바꾼다. 잘못된 값이면 이유를 돌려주고 아무것도 바꾸지 않는다."""
+        try:
+            for arm in self._arms():
+                arm.set_safety(mode, margin, box)
+        except ValueError as e:
+            return str(e)
+        self.show_safety_box()
+        return None
+
+    def show_safety_box(self) -> None:
+        if not self.scene:
+            return
+        now = self.arm.get_safety()
+        box = now["box_mm_effective"]
+        if now["mode"] == "off":
+            box = None
+        elif now["mode"] == "free" and box:  # 자유 모드는 x, y를 검사하지 않는다
+            table = self.arm.ws.table_mm
+            box = {**box, "x": [0, table["x"]], "y": [0, table["y"]]}
+        self.scene.show_allowed(box)
+
+    def set_params(self, changes: dict) -> tuple[str | None, dict]:
+        """(실패 이유, {이름: 적용 시점}). 하나라도 틀리면 아무것도 바뀌지 않는다."""
+        try:
+            timings = self.arm.set_params(changes)
+            if self.real:  # 설정 객체는 같이 쓰고 속도만 따로 있다
+                self.sim.set_speed(self.arm.speed)
+            return None, timings
+        except ValueError as e:
+            return str(e), {}
+
+    def save_preset(self, name: str) -> str | None:
+        try:
+            self.arm.save_preset(name)
+        except ValueError as e:
+            return str(e)
+        return None
+
+    def load_preset(self, name: str) -> str | None:
+        try:
+            self.arm.load_preset(name)
+            if self.real:
+                self.sim.set_speed(self.arm.speed)
+        except (ValueError, FileNotFoundError) as e:
+            return str(e)
+        return None
+
+    def _remember_objects(self, coalesce: bool) -> None:
+        """바꾸기 전 물체 목록을 되돌리기 기록에 둔다. coalesce면 0.6초 안에 이어진 끌기·조금 옮기기는 한 번으로 친다(중간값을 하나씩 되돌리지 않게)."""
+        now = time.monotonic()
+        if not (coalesce and self._object_undo and now - self._object_undo_t < 0.6):
+            self._object_undo.append(list(self.objects()))
+            del self._object_undo[:-50]
+        self._object_undo_t = now
+
+    def undo_objects(self) -> bool:
+        """수동 입력 물체를 바로 전 목록으로 되돌린다(gui-spec 12.9 (나)). 되돌릴 것이 없으면 False. MuJoCo에서는 편집처럼 잠겨 있다."""
+        self._objects_locked()
+        if not self._object_undo:
+            return False
+        before = self._object_undo.pop()
+        for obj in self.objects():
+            self.source.remove(obj.id)
+        for obj in before:
+            with contextlib.suppress(KeyError):
+                self.source.remove(obj.id)
+            self.source.add(obj)
+        self._changed_objects()
+        return True
+
+    def _objects_locked(self) -> None:
+        if self._physical():  # MuJoCo는 물체를 시작할 때 놓는다(gui-spec 12.8)
+            raise ValueError(OBJECTS_LOCKED_TEXT)
+
+    def save_workspace(self, values: dict, zone: str) -> str | None:
+        """작업대·좌표를 파일에 저장하고 팔·작업 실행에 바로 적용한다. 주석은 그대로 둔다."""
+        if min(values["table_x"], values["table_y"]) <= 0:
+            return "작업대 크기는 0보다 커야 합니다"
+        if not (0 <= values["base_x"] <= values["table_x"] and 0 <= values["base_y"] <= values["table_y"]):
+            return "팔 받침이 작업대 밖입니다"
+        if not (0 <= values["zone_x"] <= values["table_x"] and 0 <= values["zone_y"] <= values["table_y"]):
+            return "배출 구역이 작업대 밖입니다"
+        if not 0 <= values["margin"] < min(values["table_x"], values["table_y"]) / 2:
+            return "가장자리 여유가 작업대보다 큽니다"
+        path = Path(self.workspace_path)
+        path.write_text(update_workspace_text(path.read_text(encoding="utf-8"), values, zone), encoding="utf-8")
+        if self._physical():  # MuJoCo는 reload_workspace를 거부한다(arm-software-spec 13.5)
+            return SAVED_RESTART_TEXT
+        try:  # 바로 적용한다 (REQ-034). 동작·작업 중이면 파일만 저장하고 다음 시작에 적용된다
+            if self.task_running():
+                raise RuntimeError("작업 실행 중")
+            for arm in self._arms():
+                arm.reload_workspace(path)
+            self.studio.ws = self.studio.task.ws = self.arm.ws
+            if self.scene:
+                self.scene.set_workspace(self.arm.ws)  # 작업대·배출 구역·팔 자리를 바로 다시 그린다
+                self.scene.set_parts(getattr(self.arm, "scene", None))
+        except RuntimeError as e:
+            return f"저장했지만 지금은 적용하지 못했습니다({e}). 동작이 끝난 뒤 다시 저장하거나 앱을 다시 시작하세요"
+        return None
+
+    # ---- 장치·시스템
+    def run_doctor(self) -> dict:
+        """읽기 전용 점검. 블로킹이므로 스레드에서 부른다."""
+        try:  # 연결 중에는 포트를 열 수 없다. 서보 응답·전압은 연결 전에 읽은 값으로 채운다
+            report = with_first_report(doctor(probe=False, arm=self._arm_option), self._first_report)
+        except Exception as e:  # noqa: BLE001  점검이 실패해도 페이지는 살아 있어야 한다
+            return {"ok": False, "checks": [{"name": "점검", "state": "fail", "text": f"점검하지 못했습니다: {e}", "fix": ""}], "ports": [], "arm": None, "esp32": None,
+                    "zero_check": {"state": "needed", "reason": "점검하지 못했다", "date": None, "sha256": None}}
+        if self.real is None:  # 시뮬레이션은 포트를 쓰지 않으니 포트가 없어도 실패가 아니다
+            for c in report["checks"]:
+                if c["name"] == "포트 목록" and c["state"] == "fail":
+                    c.update(state="skip", text=f"시뮬레이션이라 포트를 쓰지 않습니다. {c['text']}", fix="")
+            report["ok"] = all(c["state"] != "fail" for c in report["checks"])
+        return report
+
+    def arm_names(self) -> list[str]:
+        return list(arm_files(Path(self.arms_path)))
+
+    def choose_arm(self, name: str) -> str | None:
+        """다음 실행부터 쓸 팔을 local.yaml에 적는다. 실패 이유 또는 None. 설정은 시작할 때 읽어 지금 팔은 그대로다."""
+        if name not in self.arm_names():
+            return f"팔 파일이 없습니다: {name}"
+        self._set_local("arm", name)
+        return None
+
+    def _set_local(self, key: str, value: str) -> None:
+        """config/local.yaml의 한 줄만 바꾼다(주석은 그대로). 없으면 끝에 더한다."""
+        path = Path(self.local_path)
+        text = path.read_text(encoding="utf-8") if path.exists() else ""
+        line = f"{key}: {value}"
+        text, count = re.subn(rf"^{key}:.*$", line, text, flags=re.MULTILINE)
+        path.write_text(text if count else f"{text.rstrip()}\n{line}\n".lstrip(), encoding="utf-8")
+
+    def gripper_info(self) -> dict | None:
+        """지금 그리퍼 종류와 고를 수 있는 종류 (REQ-038). 팔이 모르면 None."""
+        info = getattr(self.arm, "gripper_info", None)
+        return info() if info else None
+
+    def choose_gripper(self, name: str) -> str | None:
+        """다음 실행부터 쓸 그리퍼 종류를 local.yaml에 적는다(결정 0043-1). 실패 이유 또는 None."""
+        info = self.gripper_info()
+        if not info or name not in info["available"]:
+            return f"그리퍼 종류가 없습니다: {name}"
+        self._set_local("gripper", name)
+        return None
+
+    def _run_linkwatch(self, progress=None, stop=None) -> tuple[dict | None, str | None]:
+        """linkwatch는 포트를 직접 연다. 팔 연결을 끊고(토크는 그대로) 돌린 뒤 다시 연결한다. 그동안 움직이는 버튼은 잠긴다."""
+        if self.real is None:
+            return None, "linkwatch는 실제 팔의 포트가 필요합니다 (시뮬레이션에서는 쓸 수 없습니다)"
+        if self.real.ctl.state != "idle" or self.recording() or self.task_running():
+            return None, BUSY_TEXT
+        try:
+            port = self._pick_port()
+        except PortChoiceError as e:
+            return None, str(e)
+        result, reason = None, None
+        self._linkwatching = True
+        try:
+            self.real.disconnect()
+            try:
+                result = self.real.run_diagnostic("linkwatch", progress, lambda: self._closing or bool(stop and stop()), port=port)
+            except Exception as e:  # noqa: BLE001  포트를 못 열어도 팔은 다시 연결해야 한다
+                reason = f"linkwatch를 실행하지 못했습니다: {e}"
+        finally:
+            if not self._closing:
+                problem, torque_off = self._connect_real()
+                reason = reason or problem
+                if torque_off:
+                    reason = f"토크가 꺼진 서보: {', '.join(torque_off)}. 팔을 받쳐 주세요"
+            self._linkwatching = False
+        return result, reason
+
+    def _with_port(self, work, what: str):
+        """캘리브레이션 마법사(gui-spec 12.3): linkwatch처럼 팔 연결을 끊고(토크 유지) work(cfg)로 포트를 직접 쓴 뒤 다시 연결한다. (결과, 실패 이유)."""
+        if self.real is None:
+            return None, f"캘리브레이션 {what}은 실제 팔에서만 합니다"
+        if self.real.ctl.state != "idle" or self.recording() or self.task_running() or self._linkwatching or self._calibrating:  # 다른 탭의 측정·저장이 같은 포트를 쓰는 중
+            return None, BUSY_TEXT
+        from ..arm.autocal.engine import AutoCalibrationError
+
+        try:
+            port = self._pick_port()
+        except PortChoiceError as e:
+            return None, str(e)
+        result, reason = None, None
+        self._calibrating = True
+        try:
+            self.real.disconnect()
+            try:
+                result = work(replace(self.real.cfg, port=port))
+            except AutoCalibrationError as e:
+                reason = str(e)
+            except Exception as e:  # noqa: BLE001  포트를 못 열어도 팔은 다시 연결해야 한다
+                reason = f"{what}을 실행하지 못했습니다: {e}"
+        finally:
+            if not self._closing:
+                problem, torque_off = self._connect_real()  # 저장 뒤에는 새 캘리브레이션을 읽고 0° 확인 잠금이 걸린다
+                reason = reason or problem
+                if torque_off:
+                    reason = f"토크가 꺼진 서보: {', '.join(torque_off)}. 팔을 받쳐 주세요"
+            self._calibrating = False
+        return result, reason
+
+    def calibration_measure(self, out=print, stop=lambda: False) -> tuple[dict | None, str | None]:
+        """마법사 2단계 측정(EEPROM에 쓰지 않음, 엔진 `measure_once` REQ-052). (보고서, 실패 이유). 블로킹이라 스레드에서 부른다."""
+        from ..arm.autocal import cli
+
+        return self._with_port(lambda cfg: cli.measure_once(cfg, out=out, stop=lambda: self._closing or stop(), runs_dir=Path(self.runs_root)), "측정")
+
+    def calibration_repeat_rows(self) -> list[dict] | None:
+        """반복 합격이면 저장될 중앙값과 기존 파일(config/calibration)의 차이표, 아니면 None. 저장 전에 보여 준다(결정 0029)."""
+        if self.real is None:
+            return None
+        from ..arm.autocal.measure import compare
+        from ..arm.autocal.repeat import repeat_status
+
+        cal_id = self.real.cfg.calibration_id
+        status = repeat_status(Path(self.runs_root), cal_id)
+        if not status["passed"]:
+            return None
+        old, _ = find_calibration(cal_id, Path(self.real.config_dir))  # 엔진처럼 LeRobot 캐시를 먼저 본다: 표와 실제로 덮어쓰는 기준이 같다
+        return compare(old, status["median"])
+
+    def calibration_save(self, confirm: str, out=print) -> tuple[bool, str | None]:
+        """마법사 4단계 저장: `calibrate --save`와 같은 엔진(1회 합격이면 그 측정, 아니면 3회 반복 합격의 중앙값, 결정 0029). confirm이 yes일 때만 쓴다.
+        (저장했는지, 실패 이유). 저장 뒤 다시 연결하면 0° 확인 전까지 움직임이 잠긴다."""
+        if confirm.strip().lower() != "yes":
+            return False, "yes를 입력해야 저장합니다"
+        from argparse import Namespace
+
+        from ..arm.autocal import cli
+
+        def work(cfg):
+            a = Namespace(sim=False, auto=False, measure_only=False, save=True, from_file=None, config=str(Path(self.real.config_dir) / "robot.yaml"))
+            return cli.run_calibrate(a, cfg, input_fn=lambda _prompt: "yes", out=out, config_dir=Path(self.real.config_dir), runs_dir=Path(self.runs_root))
+
+        code, reason = self._with_port(work, "저장")
+        return code == 0, reason or (None if code == 0 else "저장하지 못했거나 저장 뒤 대조가 맞지 않습니다. 아래 기록을 보세요")
+
+    def calibration_verify_zero(self, answer, out=print) -> tuple[bool, str | None]:
+        """마법사 5단계: `calibrate --verify-zero`의 엔진으로 속도 20% 0° 자세 이동 → answer()가 돌려주는 사람의 판단("yes"면 기록).
+        answer는 팔이 0°에 선 뒤 불린다(블로킹). 기록되면 다시 연결해 잠금을 푼다. (확인됐는지, 실패 이유)."""
+        if self.real is None:
+            return False, "0° 확인은 실제 팔에서만 합니다"
+        if self.real.ctl.state != "idle" or self.recording() or self.task_running() or self._linkwatching or self._calibrating:
+            return False, BUSY_TEXT
+        if not self.real_allowed():
+            return False, "감시 프로세스가 응답하지 않아 실제 팔을 움직일 수 없습니다"
+        from ..arm.autocal.verify import run_verify_zero
+
+        prompts = iter([lambda: "", answer])  # 첫 입력은 CLI의 "준비됐으면 Enter"(마법사는 1단계 체크로 대신한다)
+        result: dict = {}
+        code = run_verify_zero(self.real, self.real.cfg, input_fn=lambda _prompt: next(prompts)(), out=out, result=result)  # result는 #233
+        if code != 0:  # 기록하지 않으면 엔진이 잠그기 전에 시작 자세(안 되면 home)로 되돌린다
+            back = {"start": "팔은 시작 자세로 돌아갔습니다", "home": "팔은 홈으로 돌아갔습니다",
+                    "failed": "팔이 돌아가지 못했습니다. 팔을 손으로 받치고, 12V를 끄기 전에 CLI에서 so101 home을 다시 해 보세요"}.get(result.get("returned"), "")
+            return False, " ".join(x for x in ("확인을 기록하지 않았습니다. 움직이는 명령은 계속 잠겨 있습니다.", back) if x)
+        self.real.disconnect()
+        problem, _ = self._connect_real()  # 연결할 때 팔 파일의 확인 기록을 다시 읽어 잠금을 푼다
+        return True, problem
+
+    def calibration_home(self) -> str | None:
+        """마법사 5단계에서 기록하지 않고 끝나 팔이 뻗은 채 0° 확인 잠금에 걸렸을 때 내리는 길: 사람이 이 버튼을 눌렀으니 정지 상태면 풀고 홈으로 간다.
+        ArmService.home만 0° 확인 잠금을 잠깐 연다(#233). 캘리브레이션 불일치·팔 파일 없음 잠금은 그대로 막힌다. 실패 이유 또는 None. 스레드에서 부른다."""
+        if self.real is None:
+            return "실제 팔이 연결되어 있지 않습니다"
+        if not self.real_allowed():
+            return "감시 프로세스가 응답하지 않아 실제 팔을 움직일 수 없습니다"
+        if self.real.ctl.state in ("stopped", "fault") and not self.real.resume():
+            return "정지를 풀지 못했습니다(통신 끊김이면 다시 연결하세요)"
+        r = self.real.home()
+        return None if r.status == "ok" else f"홈으로 가지 못했습니다: {reason_text(r.status)}"
+
+    def diagnostic_available(self, name: str) -> bool:
+        return name != "linkwatch" or self.real is not None  # 포트를 직접 열어 시뮬레이션에서는 못 쓴다
+
+    def run_diagnostic(self, name: str, progress=None, stop=None) -> tuple[dict | None, str | None]:
+        """(결과, 실패 이유). 블로킹이므로 스레드에서 부른다."""
+        if self.comm_lost():
+            return None, COMM_LOST_TEXT
+        if name == "linkwatch":
+            return self._run_linkwatch(progress, stop)
+        kw = {"repeats": 1} if name == "powertest" else {}
+        if self.real and (name in BIG_MOVES or not self.move_lock()) and self._real_blocked():  # 잠겨도 읽기는 된다
+            return None, self._real_blocked()
+        try:
+            return self.arm.run_diagnostic(name, progress, stop, **kw), None
+        except ValueError as e:
+            return None, str(e)
+        except RuntimeError as e:
+            return None, BUSY_TEXT if self.arm.ctl is not None and self.arm.ctl.busy else str(e)
+
+    def run_names(self) -> list[str]:
+        """실행 기록 폴더 이름. 최근 것이 먼저다."""
+        return logread.list_runs(self.runs_root)
+
+    def load_run(self, name: str) -> dict:
+        """실행 하나의 이벤트, 전압·온도, 토크·state·fault 띠. 옛 형식(status.csv)도 읽는다. 화면에 보내는 점은 RUN_POINTS 이하로 줄인다."""
+        if name not in self.run_names():  # 화면에서 온 이름으로 다른 경로를 읽지 않는다
+            raise ValueError(f"없는 실행: {name}")
+        folder = Path(self.runs_root) / name
+        events = [
+            {"t": e["t"] / 1e9, "kind": e.get("kind"), "code": e.get("code"), "text": json.dumps(e.get("data"), ensure_ascii=False, default=str)}
+            for e in logread.read_events(folder)
+        ]
+        rows, states = [], []
+        for row in logread.read_status(folder):
+            data = row["data"]
+            temps = data.get("temperature_c")
+            temp = max(temps.values()) if temps else data.get("max_temp_c")
+            if data.get("voltage_v") is not None and temp is not None:
+                rows.append((row["t"] / 1e9, data["voltage_v"], temp))
+                states.append((row["t"] / 1e9, data))
+        stride = max(1, len(rows) // RUN_POINTS)
+        t0 = rows[0][0] if rows else 0.0
+        return {
+            "name": name, "t0": t0, "events": events, "rows": len(rows), "duration_s": rows[-1][0] - t0 if rows else 0.0,
+            "voltage": [[round(t - t0, 2), v] for t, v, _ in rows[::stride]],
+            "temperature": [[round(t - t0, 2), c] for t, _, c in rows[::stride]],
+            "bands": run_bands(states, t0),
+        }
+
+    def logs(self) -> list[LogRecord]:
+        """앱을 켠 뒤의 CLI·GUI·감시 프로세스 기록과 파이썬 로그를 한 시간축으로 (decisions/0030)."""
+        records = list(self.logbook.records)
+        if self.arm.logger:
+            for rec in logread.merge_timeline(self.runs_root, self._started_ns, time.time_ns(), include_status=False):
+                text = f"{rec.get('kind')}: {json.dumps(rec.get('data'), ensure_ascii=False, default=str)}"
+                records.append(LogRecord(rec["t"] / 1e9, LOG_LEVELS.get(rec["level"], "INFO"), text, rec["proc"], rec.get("code"), rec["file"].split("/")[0]))
+        return sorted(records, key=lambda r: r.t)
+
+    def health_events(self) -> dict:
+        """이번 실행의 통신 끊김·토크 풀림·오류 정지 횟수 (결정 0043-5)."""
+        # shortcut: 부를 때마다 events.jsonl 전체를 읽는다, 실행이 아주 길어 느려지면 logs()처럼 이어 읽기로 바꾼다
+        return count_events(logread.read_events(self.run_dir) if self.run_dir else [])
+
+    def incidents(self) -> list[dict]:
+        return logread.list_incidents(self.runs_root)
+
+    def make_incident(self) -> str | None:
+        """지금 사고 묶음을 만든다. 폴더 경로, 기록 중이 아니면 None. 스레드에서 부른다."""
+        return self.arm.create_incident("GUI에서 수동으로 만듦")
+
+    def incident_zip(self, name: str) -> str:
+        """사고 묶음을 zip으로 묶어 경로를 돌려준다. 스레드에서 부른다."""
+        found = next((i for i in self.incidents() if i["name"] == name), None)
+        if found is None:  # 화면에서 온 이름으로 다른 경로를 묶지 않는다
+            raise ValueError(f"없는 사고 묶음: {name}")
+        return shutil.make_archive(str(Path(tempfile.mkdtemp()) / name), "zip", found["path"])
+
+    # ---- 교시
+    def sequences(self) -> list[str]:
+        return self.arm.teach.names()
+
+    def sequence(self, name: str) -> dict:
+        """기록의 요약, 화면용 표본, 3D 궤적. 궤적을 그리고 돌려준다. 스레드에서 부른다."""
+        info = self.arm.record_info(name)
+        q, t = self.arm.teach.load(name)
+        stride = max(1, len(q) // SEQUENCE_POINTS)
+        q, t = q[::stride], t[::stride] - t[0]
+        tips = [self._path_kin.fk(JointState(*row)) for row in q.tolist()]
+        segments = [
+            (s["label"], [(p.x_mm, p.y_mm, p.z_mm) for p, at in zip(tips, t, strict=True) if s["start_s"] <= at <= s["end_s"]])
+            for s in info["segments"]
+        ]
+        if self.scene:
+            self.scene.show_trajectory(segments)
+        return {"info": info, "t": t.round(3).tolist(), "q": q.round(2).tolist()}
+
+    # ---- 새 기록 (실제 팔에서만). 순서는 CLI record와 같다: 홈 -> 팔 잡기 -> 카운트다운 -> 토크 끄고 기록
+    def recording(self) -> bool:
+        return bool(self.real and self.real.teach.recording)
+
+    def record_name_problem(self, name: str) -> str | None:
+        """파일 이름이 되므로 경로 문자를 막고, 다른 기록을 덮어쓰지 않는다."""
+        if not re.fullmatch(r"[\w-]{1,40}", name or ""):
+            return "기록 이름은 글자, 숫자, -, _ 로 40자까지 쓸 수 있습니다"
+        if name in self.sequences():
+            return f"같은 이름의 기록이 있습니다: {name}"
+        return None
+
+    def record_prepare(self) -> str | None:
+        """홈으로 옮긴다. 토크를 끄면 팔이 처지므로 받침 근처에서 시작한다. 실패 이유 또는 None. 스레드에서 부른다."""
+        return self._real_blocked() or self._run_on(self.real, lambda arm: arm.home())
+
+    def record_begin(self, name: str) -> str | None:
+        """토크를 끄고 기록을 시작한다. 사람이 팔을 잡고 있어야 한다. 실패 이유 또는 None."""
+        reason = self._real_blocked() or self.record_name_problem(name)
+        if reason:
+            return reason
+        if self.task_running():
+            return "작업 실행 중입니다"
+        self.real.record_start()
+        self._record_name = name
+        return None
+
+    def record_finish(self) -> str | None:
+        """기록을 저장하고 토크를 켜서 지금 자세를 잡는다. 저장한 이름 또는 None."""
+        if not self.recording():
+            return None
+        name, self._record_name = self._record_name, None
+        try:
+            self.real.record_stop(name)
+        except Exception as e:  # noqa: BLE001  통신이 끊겼으면 저장·토크 켜기가 실패한다. 부르는 쪽의 비상 정지까지 막으면 안 된다
+            self.real.log_event("record_stop_failed", {"name": name, "error": repr(e)}, level="ERROR")
+            logging.getLogger(__name__).error("기록 저장·토크 켜기 실패(%s): 팔을 받치고 다시 연결하세요", e)  # 로그 화면·알림에 보인다
+            return None
+        return name
+
+    def record_truncated(self) -> float | None:
+        """최대 시간에 걸려 앞부분만 남았으면 그 시간(초)."""
+        teach = self.real.teach
+        return teach.max_s if teach.truncated else None
+
+    def replay(self, name: str, speed: float, until_limit: bool = False, segment_speeds: dict[int, float] | None = None,
+               mode: str = "original", any_gripper: bool = False) -> str | None:
+        """mode: original(기록 그대로) | fitted(속도·가속 한도에 맞게 늦춘 변환본, REQ-034).
+        any_gripper: 다른 그리퍼로 남긴 기록도 재생한다(REQ-113, 화면 확인 창 뒤에만)."""
+        reason = self._dispatch(lambda arm: arm.replay(name, speed, until_limit, segment_speeds, mode, any_gripper=any_gripper), f"{name} 재생")
+        advice = "기록에 허용 범위 밖 자세가 있어 재생하지 않았습니다(첫 자세까지는 이동합니다). 한계 앞까지만 재생을 켜 보세요"
+        if reason == EDGE_TEXT and not until_limit:  # EDGE_TEXT로 시작하면 화면이 가장자리 검사를 끌지 묻는다
+            return f"{EDGE_TEXT}. {advice}"
+        if reason in (MOTION_TEXT["out_of_bounds"], OUTSIDE_TEXT) and not until_limit:
+            return advice
+        return reason
+
+    def replay_fit(self, name: str, speed: float, segment_speeds: dict[int, float] | None = None) -> dict | None:
+        """이 배속으로 원본 재생이 한도 안인지와 변환본이 늦추는 정도. 계산할 수 없으면 None."""
+        try:
+            return self.arm.record_info(name, speed, segment_speeds).get("fit")
+        except (ValueError, FileNotFoundError, KeyError):
+            return None
+
+    def replay_cut(self) -> str | None:
+        """한계 앞까지만 재생했을 때 어디서 잘렸는지."""
+        cut = self._model_arm().teach.last_cut
+        if cut is None:
+            return None
+        at, total, why = cut
+        return f"표본 {total}개 중 {at}개까지 재생했습니다: {reason_text(why)}"
+
+    def disconnected(self, client: str) -> None:
+        """조작하던 브라우저의 연결이 끊기면 팔을 세운다(토크는 유지)."""
+        if self.owner == client:
+            self.owner = None
+            self.arm.log_event("owner_lost", {"client": client}, level="WARN")
+            self.record_finish()  # 토크가 꺼진 채 조작하던 화면이 사라지면 지금 자세를 잡는다
+            self.stop_task()
+
+    def estop(self) -> str | None:
+        """앞 단계가 실패해도 모든 팔에 정지가 간다(감사 2026-11-07: 예외 하나로 실제 팔이 정지를 못 받던 순서).
+        서보에 정지 자세를 쓰지 못한 팔이 있으면 그 이유(화면이 경고로 보인다), 모두 됐으면 None."""
+        failed = []
+        try:
+            self.record_finish()  # 기록 중에는 토크가 꺼져 있어 정지 명령만으로는 팔이 서지 않는다
+            self.paused = False
+            self.studio.stop()
+            self.pending = None
+        except Exception:  # 정지 준비가 실패해도 아래 팔 정지는 반드시 한다
+            logging.getLogger(__name__).exception("E-STOP 준비 단계 실패")
+        for arm in self._arms():
+            try:
+                err = arm.estop()  # Studio.estop은 실행 기록에 남기지 않는다. REQ-043부터 서보에 못 쓰면 이유를 돌려준다
+            except Exception as e:  # 한 팔이 실패해도 다음 팔은 세운다
+                logging.getLogger(__name__).exception("E-STOP 실패")
+                err = repr(e)
+            if err:
+                failed.append(f"{'실제 팔' if arm is self.real else '시뮬레이션'}: {err}")
+        return ESTOP_FAILED_TEXT.format("; ".join(failed)) if failed else None
+
+    def close(self) -> None:
+        self._closing = True
+        logging.getLogger().removeHandler(self.logbook)
+        if self._listener:
+            self._listener.close()
+        self.record_finish()
+        if self.policy is not None:
+            self.policy.stop()
+        self.stop_task()  # 제어 루프를 먼저 끄면 동작을 기다리던 스레드가 풀리지 않아 프로세스가 안 꺼진다
+        if self.perception_source is not self.source:  # 초음파 소스(실물이면 포트)를 닫는다
+            with contextlib.suppress(Exception):
+                self.perception_source.close()
+        for arm in self._arms():
+            arm.ctl.wait_idle()
+            arm.disconnect()
+        if self.scene:
+            self.scene.close()
+        if self.link:
+            self.link.stop()
+
+    def readout(self) -> dict[str, str]:
+        """상태줄에 보일 값. 키는 상태줄 칸 이름이다."""
+        arm = self.arm
+        values = {
+            "팔": "실제" if self.real else "시뮬레이션(MuJoCo)" if self._physical() else "시뮬레이션",
+            "실행 방식": RUN_MODES[self.mode],
+            "감시": self.link.text() if self.link else "없음",
+            "속도": f"{arm.speed:.0f} %",
+            "안전 모드": SAFETY_TEXT.get(arm.safety.settings.mode, arm.safety.settings.mode),
+            "기록 폴더": arm.logger.dir.name if arm.logger else EMPTY,
+            "닿는지·오차": self.reach,
+        }
+        st = self.state.status
+        if st is None:
+            return values
+        p = self.tip_now()
+        x, y, h = p["x"], p["y"], p["h"]
+        return values | {
+            "전압": f"{st.voltage_v:.1f} V",
+            "최고 온도": hottest_text(st),
+            "손끝 좌표": f"x {x:4.0f}  y {y:4.0f}  높이 {h:4.0f} mm",  # 폭을 고정해 값이 바뀔 때 옆 칸이 흔들리지 않게 한다
+            "토크": "켜짐" if st.torque_enabled else "꺼짐",
+        }

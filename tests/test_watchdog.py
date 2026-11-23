@@ -1,0 +1,361 @@
+"""E-STOP 감시 프로세스와 정지 수신 스레드 (REQ-011, decisions/0026)."""
+import dataclasses
+import json
+import os
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+
+import pytest
+
+from so101_studio.arm.sim_driver import SimDriver
+from so101_studio.core.config import load_robot, load_workspace
+from so101_studio.service.arm_service import ArmService
+from so101_studio.service.stop_listener import StopListener
+from so101_studio.watchdog.core import Watchdog
+from so101_studio.watchdog.hotkey import vk
+from so101_studio.watchdog.server import make_server
+
+CFG = load_robot("config/robot.yaml")
+WS = load_workspace("tests/workspace_600x400.yaml")
+
+
+class Clock:
+    def __init__(self):
+        self.t = 100.0
+
+    def __call__(self):
+        return self.t
+
+
+def recorded(wd, acked=True):
+    """실제 UDP·프로세스 종료 대신 호출만 기록한다."""
+    calls = []
+    wd._send_estop = lambda port, reason: calls.append(("estop", port, reason)) or acked
+    wd._kill = lambda pid: calls.append(("kill", pid)) or True
+    return calls
+
+
+def free_udp_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+# ---- 단위: 가짜 시계로 작동 판정
+def test_trips_only_after_one_second_without_heartbeat_when_armed():
+    clk = Clock()
+    wd = Watchdog(clock=clk)
+    calls = recorded(wd)
+    clk.t += 5
+    assert not wd.tick() and not calls  # armed가 아니면 오래 끊겨도 작동하지 않는다
+    wd.arm(True, pid=4242, stop_port=8091)
+    clk.t += 0.9
+    assert not wd.tick()
+    wd.heartbeat("browser")
+    wd.heartbeat("server")
+    clk.t += 0.9
+    assert not wd.tick()  # 둘 다 0.9초 전에 왔다
+    clk.t += 0.2  # 1.1초 경과
+    assert wd.tick() and calls == [("estop", 8091, "heartbeat 끊김: browser,server")]  # ack가 오면 프로세스는 끝내지 않는다
+    assert wd.status()["tripped"] and not wd.tick()  # 한 번만 작동하고 상태를 유지한다
+
+
+@pytest.mark.parametrize("alive", ["browser", "server"])
+def test_either_missing_heartbeat_trips(alive):
+    clk = Clock()
+    wd = Watchdog(clock=clk)
+    calls = recorded(wd)
+    wd.arm(True, pid=4242, stop_port=8091)
+    for _ in range(3):
+        clk.t += 0.5
+        wd.heartbeat(alive)
+        wd.tick()
+    other = "server" if alive == "browser" else "browser"
+    assert calls and other in calls[0][2] and alive not in calls[0][2]
+
+
+def test_no_ack_kills_the_process_and_rearm_resets():
+    clk = Clock()
+    wd = Watchdog(clock=clk)
+    calls = recorded(wd, acked=False)
+    wd.arm(True, pid=4242, stop_port=8091)
+    clk.t += 1.1
+    assert wd.tick()
+    assert [c[0] for c in calls] == ["estop", "kill"] and calls[1] == ("kill", 4242)
+    wd.arm(True, pid=4242, stop_port=8091)  # 다시 등록하면 작동 상태가 풀린다
+    assert not wd.status()["tripped"] and not wd.tick()
+
+
+def _udp_replier(reply: bytes | None):
+    """127.0.0.1의 UDP 서버: 받은 정지 명령에 reply로 답한다(None이면 답하지 않는다). (포트, 받은 메시지 목록, 닫는 함수)"""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("127.0.0.1", 0))
+    sock.settimeout(0.2)
+    got, stop = [], threading.Event()
+
+    def loop():
+        while not stop.is_set():
+            try:
+                data, addr = sock.recvfrom(1024)
+            except TimeoutError:
+                continue
+            got.append(json.loads(data))
+            if reply is not None:
+                sock.sendto(reply, addr)
+
+    th = threading.Thread(target=loop, daemon=True)
+    th.start()
+    return sock.getsockname()[1], got, lambda: (stop.set(), th.join(1), sock.close())
+
+
+@pytest.mark.parametrize("reply,killed", [(b'{"ack": "nope"}', True), (b"not json", True), (None, True), (b'{"ack": "estop", "ok": true}', False)])
+def test_real_udp_ack_decides_whether_the_process_is_killed(reply, killed):
+    port, got, close = _udp_replier(reply)
+    clk = Clock()
+    wd = Watchdog(clock=clk, ack_timeout=0.2)
+    kills = []
+    wd._kill = lambda pid: kills.append(pid) or True
+    wd.arm(True, pid=4242, stop_port=port)
+    clk.t += 1.1
+    try:
+        assert wd.tick()
+    finally:
+        close()
+    assert got and got[0]["cmd"] == "estop"  # 실제 UDP로 나갔다
+    assert bool(kills) is killed and (kills == [4242] if killed else True)  # 잘못된 응답·무응답이면 끝내고, 올바른 ack면 끝내지 않는다
+
+
+def test_kill_never_targets_its_own_process():
+    assert Watchdog._kill(os.getpid()) is False
+
+
+def test_sim_and_disarmed_only_log():
+    clk, logs = Clock(), []
+    wd = Watchdog(sim=True, clock=clk, log=logs.append)
+    calls = recorded(wd)
+    wd.arm(True, pid=4242, stop_port=8091)
+    clk.t += 3
+    assert not wd.tick() and not wd.trip("단축키 F9") and not calls and not wd.status()["tripped"]
+    assert any(r["event"] == "trip_ignored" for r in logs)
+    wd2 = Watchdog(clock=clk)
+    calls2 = recorded(wd2)
+    assert not wd2.trip("단축키 F9") and not calls2  # armed가 아니면 단축키도 기록만
+
+
+def test_arm_validation_and_hotkey_names():
+    wd = Watchdog()
+    with pytest.raises(ValueError):
+        wd.arm(True)
+    with pytest.raises(ValueError):
+        wd.heartbeat("nobody")
+    assert vk("F9") == 0x78 and vk("f1") == 0x70 and vk("q") == ord("Q")
+    with pytest.raises(ValueError):
+        vk("F13")
+
+
+# ---- HTTP 입구
+def test_http_api_and_cors():
+    wd = Watchdog(sim=True)
+    srv = make_server(wd, 0)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+
+    def call(path, method="GET", body=None):
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(base + path, data=data, method=method, headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=2) as r:
+                return r.status, r.headers, json.loads(r.read() or b"null")
+        except urllib.error.HTTPError as e:
+            return e.code, e.headers, json.loads(e.read())
+
+    try:
+        st, h, _ = call("/hb", "OPTIONS")
+        assert st == 204 and h["Access-Control-Allow-Origin"] == "*"
+        assert call("/hb?src=browser")[0::2] == (200, {"ok": True}) and call("/hb?src=server", "POST")[0] == 200
+        assert call("/hb?src=x")[0] == 400
+        assert call("/arm", "POST", {"armed": True, "pid": 4242})[0] == 400  # stop_port 없음
+        assert call("/arm", "POST", {"armed": True, "pid": 4242, "stop_port": 8091})[0] == 200
+        st, h, s = call("/status")
+        assert s["alive"] and s["armed"] and not s["tripped"] and set(s["age_s"]) == {"browser", "server"} and h["Access-Control-Allow-Origin"] == "*"
+        assert call("/estop", "POST")[2]["tripped"] is False  # 시뮬레이션: 기록만
+        assert call("/nope")[0] == 404
+    finally:
+        srv.shutdown()
+
+
+# ---- 통합: SimDriver ArmService + StopListener + 감시
+@pytest.fixture
+def svc(tmp_path):
+    s = ArmService(SimDriver(CFG.poses["home"]), dataclasses.replace(CFG), WS, speed_pct=50, log_root=str(tmp_path))
+    ok, msg = s.connect()
+    assert ok, msg
+    yield s
+    s.disconnect()
+
+
+def test_stop_listener_estops_and_acks(svc):
+    svc.driver.set_torque(True)
+    lis = StopListener(svc, port=0).start()
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(1)
+            s.sendto(b"not json", ("127.0.0.1", lis.port))  # 이상한 입력은 무시
+            s.sendto(json.dumps({"cmd": "estop"}).encode(), ("127.0.0.1", lis.port))
+            assert json.loads(s.recvfrom(256)[0]) == {"ack": "estop", "ok": True}
+        assert svc.ctl.state == "stopped" and svc.driver.torque_enabled()  # 토크는 유지
+    finally:
+        lis.close()
+
+
+def test_stop_listener_ack_says_not_ok_when_the_servo_write_fails_and_stops_before_logging(svc):
+    order = []
+    orig_stop, orig_note = svc.ctl.estop, svc.on_watchdog_stop
+    svc.ctl.estop = lambda: order.append("estop") or "SerialTimeoutException('x')"  # 서보 쓰기 실패를 흉내
+    svc.on_watchdog_stop = lambda reason=None: order.append("log")
+    lis = StopListener(svc, port=0).start()
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(1)
+            s.sendto(json.dumps({"cmd": "estop", "reason": "t"}).encode(), ("127.0.0.1", lis.port))
+            ack = json.loads(s.recvfrom(256)[0])
+        assert ack["ack"] == "estop" and ack["ok"] is False and "Serial" in ack["comm_error"]
+        assert order == ["estop", "log"]  # 정지가 기록보다 먼저
+    finally:
+        lis.close()
+        svc.ctl.estop, svc.on_watchdog_stop = orig_stop, orig_note
+
+
+def test_heartbeat_loss_stops_the_arm_within_1_3_seconds(svc):
+    lis = StopListener(svc, port=0).start()
+    dummy = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    wd, stop = Watchdog(), threading.Event()
+    threading.Thread(target=wd.run, args=(stop,), daemon=True).start()
+    try:
+        wd.arm(True, pid=dummy.pid, stop_port=lis.port)
+        t_end = time.monotonic() + 0.5
+        while time.monotonic() < t_end:  # 0.5초 동안은 heartbeat가 정상으로 온다
+            wd.heartbeat("browser")
+            wd.heartbeat("server")
+            time.sleep(0.1)
+        assert svc.ctl.state == "idle"
+        t_last = time.monotonic()
+        while not wd.status()["tripped"] and time.monotonic() - t_last < 3:
+            time.sleep(0.01)
+        assert wd.status()["tripped"] and time.monotonic() - t_last < 1.3
+        assert svc.ctl.state == "stopped" and dummy.poll() is None  # 응답이 왔으니 프로세스는 끝내지 않는다
+    finally:
+        stop.set()
+        lis.close()
+        dummy.kill()
+        dummy.wait()
+
+
+def test_unresponsive_target_process_is_terminated():
+    dummy = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    wd, stop = Watchdog(), threading.Event()
+    threading.Thread(target=wd.run, args=(stop,), daemon=True).start()
+    try:
+        wd.arm(True, pid=dummy.pid, stop_port=free_udp_port())  # 아무도 받지 않는 포트
+        assert dummy.wait(timeout=3) is not None  # 1.0초 감시 + 0.3초 응답 대기 뒤 끝난다
+        assert wd.status()["tripped"]
+    finally:
+        stop.set()
+        dummy.kill()
+
+
+def test_second_watchdog_cannot_bind_the_same_port():
+    srv = make_server(Watchdog(sim=True), 0)
+    try:
+        with pytest.raises(OSError):
+            make_server(Watchdog(sim=True), srv.server_address[1])
+    finally:
+        srv.server_close()
+
+
+# ---- 감시 기록 폴더 갱신 (POST /arm의 run_dir)
+
+def test_runlog_switches_folders_only_under_the_same_root(tmp_path):
+    import json
+
+    from so101_studio.watchdog.runlog import RunLog
+
+    a, b = tmp_path / "20260101-000000", tmp_path / "20260101-000100"
+    a.mkdir()
+    rl = RunLog(a / "watchdog.jsonl")
+    rl.write("one")
+    assert rl.switch(str(b)) == (b / "watchdog.jsonl").resolve()
+    rl.write("two")
+    assert rl.switch(str(b)) == (b / "watchdog.jsonl").resolve()  # 같은 폴더면 그대로
+    for bad in (str(tmp_path.parent), str(tmp_path / "x" / "y"), "", None, 5):
+        with pytest.raises(ValueError):
+            rl.switch(bad)
+    rl.write("three")
+    rl.close()
+    kinds = lambda p: [json.loads(x)["kind"] for x in (p / "watchdog.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert kinds(a) == ["one"] and kinds(b) == ["two", "three"]
+
+
+def test_arm_with_run_dir_moves_the_log_and_a_rejected_dir_does_not_arm(tmp_path):
+    from so101_studio.watchdog.runlog import RunLog
+
+    a = tmp_path / "r1"
+    a.mkdir()
+    rl = RunLog(a / "watchdog.jsonl")
+    wd = Watchdog(sim=True, log=lambda rec: rl.write(rec.get("event", "log"), rec))
+    wd.on_run_dir = rl.switch
+    wd.arm(True, 1234, 8091, run_dir=str(tmp_path / "r2"))
+    assert wd.armed and (tmp_path / "r2" / "watchdog.jsonl").exists()
+    with pytest.raises(ValueError):
+        wd.arm(False, run_dir=str(tmp_path.parent))
+    assert wd.armed  # 거절되면 등록 상태도 그대로
+    rl.close()
+
+
+def test_trip_exception_releases_busy_and_is_logged():
+    clk, logs = Clock(), []
+    wd = Watchdog(clock=clk, log=logs.append)
+    wd._send_estop = lambda port, reason: (_ for _ in ()).throw(RuntimeError("boom"))
+    wd.arm(True, pid=4242, stop_port=8091)
+    clk.t += 1.1
+    assert wd.tick() is False  # 예외가 tick 밖으로 새지 않는다
+    assert any(r["event"] == "trip_error" for r in logs)
+    assert not wd._busy and not wd.status()["tripped"]  # 다음 tick에 다시 시도할 수 있다
+    errors = [r for r in logs if r["event"] == "trip_error"]
+    clk.t += 0.5
+    assert wd.tick() is False and len([r for r in logs if r["event"] == "trip_error"]) == len(errors)  # 재시도 간격(1초) 안에서는 다시 시도하지도 기록하지도 않는다
+    clk.t += 1.0
+    wd._send_estop = lambda port, reason: True
+    assert wd.tick() is True
+
+
+def test_run_loop_survives_a_tick_exception_and_status_reports_last_tick():
+    clk, logs = Clock(), []
+    wd = Watchdog(clock=clk, log=logs.append)
+    assert wd.status()["last_tick_age_s"] is None
+    calls = {"n": 0}
+    real = wd.tick
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("tick boom")
+        return real()
+
+    wd.tick = flaky
+    stop = threading.Event()
+    th = threading.Thread(target=wd.run, args=(stop, 200.0), daemon=True)
+    th.start()
+    deadline = time.time() + 3
+    while calls["n"] < 3 and time.time() < deadline:
+        time.sleep(0.01)
+    stop.set()
+    th.join(1)
+    assert calls["n"] >= 3 and any(r["event"] == "tick_error" for r in logs)  # 예외 뒤에도 계속 돈다
+    clk.t += 5
+    assert wd.status()["last_tick_age_s"] == pytest.approx(5.0, abs=0.01)  # 이후 tick이 없으면 나이가 커진다

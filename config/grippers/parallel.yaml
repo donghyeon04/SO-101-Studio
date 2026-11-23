@@ -1,0 +1,25 @@
+# 병렬 그리퍼(Robonine Parallel Gripper, STS3215 ID 6, 스트로크 84mm). 결정 0043-1. 기본 그리퍼(robot.yaml `gripper: parallel`, REQ-098).
+# TCP는 두 턱 중앙, 보정 0, 기본 수직(grasp_tilt_deg 0), `grasp_approach: auto`면 접근 각도 후보 고르기(arm-software-spec 6.6.1), W <= G - 4. 아래 값은 모두 실물 시험 전 시작값이다 (runbook에서 채운다).
+gripper: parallel
+gripper_width_mm: [[0, 0], [100, 84]]   # [서보 값, 벌림 폭 mm]. 실물 몫: 카드·캘리퍼로 잰 표로 바꾼다
+grasp_max_open_mm: 84
+grasp_tilt_deg: 0
+grasp_min_contact_mm: 8                 # 실물 몫
+gripper_tip_offset_mm: 10               # TCP(두 턱 중앙) -> 손끝, 도구 축 방향. URDF의 TCP는 손끝보다 10mm 위. 실물에서 확인
+contact_lag_units: 4.0                  # 실물 몫: 접촉 감지 지연 기준
+gripper_squeeze_torque: 300             # 실물 몫
+gripper_hold_torque: 200                # 실물 몫
+gripper_load_warn_pct: 60               # 실물 몫
+urdf: assets/so101_parallel.urdf    # 관절 이름 gripper, 서보 ID 6 그대로 (REQ-041)
+grasp_approach: vertical                # vertical(수직) | auto(6.6.1, 결정 0069). M5에서 auto가 vertical 이상이면 기본을 바꾼다
+grasp_approach_min_width_mm: 40         # 6.6.1: 무는 치수 D가 이 값 이하인 면 쌍은 기울이지 않는다(M5 auto 거짓 성공 21건이 모두 폭 30~40mm를 기울여 쥔 것)
+grasp_approach_tilts_deg: [0, 20, 35, 50]
+grasp_contact_tilt_max_deg: 20          # 시작값(실측 근거 없음). 58mm 상자의 높이 규칙과 같은 값
+grasp_approach_tilt_pref_deg: 35
+# 자세(REQ-103, 피드백 F1): home은 손목 90°로 두 턱이 양옆으로 나란히 보이게. 설정 겹은 키 단위로 통째로 바꾸므로 park·radar_clear도 robot.yaml 값 그대로 함께 적는다.
+# episode_start = 옛 home(wrist_roll 0): MuJoCo 시작·다시 짓기·수집·정책 실행과 초음파 벤치마크 가상 팔이 쓴다(ACT v2·비교 실험이 이 자세에서 시작).
+poses:
+  home: [0, -90, 93, 0, 90, 3]
+  park: [0, -90, 93, 0, 0, 3]
+  radar_clear: [0, -90, 85, -90, 0, 3]
+  episode_start: [0, -90, 93, 0, 0, 3]
